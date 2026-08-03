@@ -111,38 +111,90 @@ const STATUS_SHADE_TO_LIGHTNESS: Record<number, number> = {
 	950: 14,
 };
 
-function resolveStatusBackgroundColor(
-	statusKeys: string[],
+function resolveStatusBackgroundColorByCode(
+	statusCode: string | null | undefined,
 	statusStyleByCode: Record<string, InspectionStatusStyle>,
 ) {
-	for (const keyCandidate of statusKeys) {
-		const normalizedKey = keyCandidate.trim().toUpperCase();
-		if (!normalizedKey) {
+	const normalizedCode = normalizeStatusLookupKey(statusCode);
+	if (!normalizedCode) {
+		return "rgb(255 255 255 / 1)";
+	}
+
+	const style = statusStyleByCode[normalizedCode];
+	if (!style) {
+		return "rgb(255 255 255 / 1)";
+	}
+
+	const palette = STATUS_PALETTE_HUE_SAT[String(style.kolor ?? "").trim().toLowerCase()];
+	if (!palette) {
+		return "rgb(255 255 255 / 1)";
+	}
+
+	const shade = Number.isFinite(style.odcien)
+		? Math.round(Number(style.odcien))
+		: 200;
+	const lightness = STATUS_SHADE_TO_LIGHTNESS[shade] ?? STATUS_SHADE_TO_LIGHTNESS[200];
+	const opacity = Number.isFinite(style.intensywnosc)
+		? Math.max(0, Math.min(100, Number(style.intensywnosc))) / 100
+		: 0.75;
+
+	return `hsl(${palette.hue} ${palette.saturation}% ${lightness}% / ${opacity})`;
+}
+
+function resolveStatusBackgroundColor(
+	statusCodes: Array<string | null | undefined>,
+	statusStyleByCode: Record<string, InspectionStatusStyle>,
+) {
+	for (const statusCode of statusCodes) {
+		const color = resolveStatusBackgroundColorByCode(statusCode, statusStyleByCode);
+		if (color !== "rgb(255 255 255 / 1)") {
+			return color;
+		}
+	}
+
+	const ignoredWords = new Set(["a", "do", "i", "na", "po", "w", "z"]);
+	const normalizedCandidates = statusCodes
+		.map((statusCode) => normalizeStatusLookupKey(statusCode))
+		.filter(Boolean);
+
+	for (const candidate of normalizedCandidates) {
+		const candidateWords = candidate
+			.replace(/\b(odp)\.?\b/g, "odpowiedz")
+			.split(" ")
+			.filter((word) => word.length > 2 && !ignoredWords.has(word));
+		if (candidateWords.length < 2) {
 			continue;
 		}
 
-		const style = statusStyleByCode[normalizedKey];
-		if (!style) {
-			continue;
+		for (const storedKey of Object.keys(statusStyleByCode)) {
+			const storedWords = storedKey
+				.replace(/\b(odp)\.?\b/g, "odpowiedz")
+				.split(" ")
+				.filter((word) => word.length > 2 && !ignoredWords.has(word));
+			const matchingWords = candidateWords.filter((word) => storedWords.includes(word));
+
+			if (
+				matchingWords.length >= 2 &&
+				matchingWords.length / Math.min(candidateWords.length, storedWords.length) >= 0.75
+			) {
+				const color = resolveStatusBackgroundColorByCode(storedKey, statusStyleByCode);
+				if (color !== "rgb(255 255 255 / 1)") {
+					return color;
+				}
+			}
 		}
-
-		const palette = STATUS_PALETTE_HUE_SAT[String(style.kolor ?? "").trim().toLowerCase()];
-		if (!palette) {
-			continue;
-		}
-
-		const shade = Number.isFinite(style.odcien)
-			? Math.round(Number(style.odcien))
-			: 200;
-		const lightness = STATUS_SHADE_TO_LIGHTNESS[shade] ?? STATUS_SHADE_TO_LIGHTNESS[200];
-		const opacity = Number.isFinite(style.intensywnosc)
-			? Math.max(0, Math.min(100, Number(style.intensywnosc))) / 100
-			: 0.75;
-
-		return `hsl(${palette.hue} ${palette.saturation}% ${lightness}% / ${opacity})`;
 	}
 
 	return "rgb(255 255 255 / 1)";
+}
+
+function normalizeStatusLookupKey(value: string | null | undefined) {
+	return String(value ?? "")
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, " ");
 }
 
 function getStoredDashboardActiveSection(): "inspections" | "recommendations" {
@@ -271,17 +323,17 @@ function normalizePolishLabel(label: string) {
         return label
                 .replace(/inspekcja\b/gi, "inspekcja")
                 .replace(/inspekcji\b/gi, "inspekcji")
-                .replace(/przed inspekcja\b/gi, "Przed inspekcją")
-                .replace(/w trakcie inspekcji\b/gi, "W trakcie inspekcji")
-                .replace(/po inspekcji\b/gi, "Po inspekcji")
-                .replace(/rekomendacje\b/gi, "Rekomendacje")
-                .replace(/wplynely\b/gi, "Wpłynęły")
-                .replace(/wplynela\b/gi, "Wpłynęła")
+					.replace(/przed inspekcja\b/gi, "przed inspekcją")
+					.replace(/w trakcie inspekcji\b/gi, "w trakcie inspekcji")
+					.replace(/po inspekcji\b/gi, "po inspekcji")
+					.replace(/rekomendacje\b/gi, "rekomendacje")
+					.replace(/wplynely\b/gi, "wpłynęły")
+					.replace(/wplynela\b/gi, "wpłynęła")
                 .replace(/zastrzezenia\b/gi, "zastrzeżenia")
                 .replace(/odpowiedz\b/gi, "odpowiedź")
                 .replace(/zamkniete\b/gi, "zamknięte")
-                .replace(/piszemy zalecenia\b/gi, "Piszemy zalecenia")
-                .replace(/pismo ustalenia\b/gi, "Pismo ustalenia");
+					.replace(/piszemy zalecenia\b/gi, "piszemy zalecenia")
+					.replace(/pismo ustalenia\b/gi, "pismo ustalenia");
 }
 
 function getInspectionCountLabel(count: number) {
@@ -369,27 +421,6 @@ function shortenDuplicatedStatusLabel(label: string) {
         }
 
         return normalized;
-}
-
-function buildStatusLabelVariants(label: string) {
-	const variants = new Set<string>();
-	const raw = String(label ?? "").trim();
-	if (!raw || raw === "-") {
-		return [] as string[];
-	}
-
-	const normalizedPolish = normalizePolishLabel(raw).trim();
-	const shortened = shortenDuplicatedStatusLabel(raw).trim();
-	const dashShort = raw.split("-")[0]?.trim() ?? "";
-	const normalizedDashShort = normalizePolishLabel(dashShort).trim();
-
-	for (const candidate of [raw, normalizedPolish, shortened, dashShort, normalizedDashShort]) {
-		if (candidate && candidate !== "-") {
-			variants.add(candidate);
-		}
-	}
-
-	return Array.from(variants);
 }
 
 type StageFilter = {
@@ -785,7 +816,7 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 
 			const nextStyleByCode: Record<string, InspectionStatusStyle> = {};
 			const addStatusStyle = (rawKey: string | null | undefined, style: InspectionStatusStyle) => {
-				const normalizedKey = String(rawKey ?? "").trim().toUpperCase();
+				const normalizedKey = normalizeStatusLookupKey(rawKey);
 				if (!normalizedKey) {
 					return;
 				}
@@ -803,6 +834,7 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 				addStatusStyle(entry.kodPozycji, style);
 				addStatusStyle(entry.skrotPozycji, style);
 				addStatusStyle(entry.nazwaPozycji, style);
+				addStatusStyle(entry.nazwaUzytkowa, style);
 			}
 
 			setInspectionStatusStyleByCode(nextStyleByCode);
@@ -834,7 +866,7 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 				rawKey: string | null | undefined,
 				style: InspectionStatusStyle,
 			) => {
-				const normalizedKey = String(rawKey ?? "").trim().toUpperCase();
+				const normalizedKey = normalizeStatusLookupKey(rawKey);
 				if (!normalizedKey) {
 					return;
 				}
@@ -852,6 +884,7 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 				addStatusStyle(entry.kodPozycji, style);
 				addStatusStyle(entry.skrotPozycji, style);
 				addStatusStyle(entry.nazwaPozycji, style);
+				addStatusStyle(entry.nazwaUzytkowa, style);
 			}
 
 			setRecommendationStatusStyleByCode(nextStyleByCode);
@@ -1018,67 +1051,6 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 		[inspectionStageLabelByCode],
 	);
 
-	const inspectionStatusKeysByStageCode = useMemo(() => {
-		const byCode = new Map<string, Set<string>>();
-
-		for (const row of rows) {
-			const normalizedCodes = [row.stageGroupCode, row.stageSubgroupCode]
-				.map((value) => String(value ?? "").trim().toLowerCase())
-				.filter(Boolean);
-			if (normalizedCodes.length === 0) {
-				continue;
-			}
-
-			const rowKeys = [
-				String(row.stageGroupCode ?? "").trim(),
-				String(row.stageSubgroupCode ?? "").trim(),
-				...buildStatusLabelVariants(String(row.statusInspekcji ?? "")),
-			].filter(Boolean);
-
-			for (const normalizedCode of normalizedCodes) {
-				const keySet = byCode.get(normalizedCode) ?? new Set<string>();
-				for (const rowKey of rowKeys) {
-					keySet.add(rowKey);
-				}
-				byCode.set(normalizedCode, keySet);
-			}
-		}
-
-		return byCode;
-	}, [rows]);
-
-	const inspectionStatusKeysByStageLabel = useMemo(() => {
-		const byLabel = new Map<string, Set<string>>();
-
-		for (const row of rows) {
-			const rowLabelVariants = buildStatusLabelVariants(String(row.statusInspekcji ?? ""));
-			if (rowLabelVariants.length === 0) {
-				continue;
-			}
-
-			const rowKeys = [
-				String(row.stageGroupCode ?? "").trim(),
-				String(row.stageSubgroupCode ?? "").trim(),
-				...rowLabelVariants,
-			].filter(Boolean);
-
-			for (const rowLabelVariant of rowLabelVariants) {
-				const normalizedLabelKey = rowLabelVariant.trim().toLowerCase();
-				if (!normalizedLabelKey) {
-					continue;
-				}
-
-				const keySet = byLabel.get(normalizedLabelKey) ?? new Set<string>();
-				for (const rowKey of rowKeys) {
-					keySet.add(rowKey);
-				}
-				byLabel.set(normalizedLabelKey, keySet);
-			}
-		}
-
-		return byLabel;
-	}, [rows]);
-
 	useEffect(() => {
 		if (visibleStageStatuses.length === 0) {
 			if (selectedStageFilters.length > 0) {
@@ -1179,63 +1151,6 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 			}),
 		[recommendationRows],
 	);
-
-	const recommendationStatusKeysByGroupCode = useMemo(() => {
-		const byCode = new Map<string, Set<string>>();
-
-		for (const group of orderedRecommendationGroups) {
-			const groupCode = String(group.stageGroupCode ?? "").trim().toLowerCase();
-			if (!groupCode) {
-				continue;
-			}
-
-			const groupLabel = String(group.stageGroupLabel ?? "").trim().toLowerCase();
-			const groupShortLabel = String(group.stageGroupShortLabel ?? "")
-				.trim()
-				.toLowerCase();
-			const keySet = byCode.get(groupCode) ?? new Set<string>();
-
-			for (const row of visibleRecommendationRows) {
-				const rowStatus = String(row.status ?? "").trim();
-				const rowStatusShort = String(row.statusSkrot ?? "").trim();
-				const normalizedRowStatus = rowStatus.toLowerCase();
-				const normalizedRowStatusShort = rowStatusShort.toLowerCase();
-				const rowStatusDashShort = rowStatus.split("-")[0]?.trim().toLowerCase() ?? "";
-
-				const matchesGroup =
-					normalizedRowStatus === groupCode ||
-					(groupLabel && normalizedRowStatus === groupLabel) ||
-					(groupShortLabel && normalizedRowStatusShort === groupShortLabel) ||
-					(groupLabel && normalizedRowStatus.includes(groupLabel)) ||
-					(groupLabel && groupLabel.includes(normalizedRowStatus)) ||
-					(groupShortLabel && normalizedRowStatusShort.includes(groupShortLabel)) ||
-					(groupShortLabel && groupShortLabel.includes(normalizedRowStatusShort)) ||
-					(groupShortLabel && rowStatusDashShort === groupShortLabel);
-
-				if (!matchesGroup) {
-					continue;
-				}
-
-				if (rowStatus) {
-					keySet.add(rowStatus);
-					for (const variant of buildStatusLabelVariants(rowStatus)) {
-						keySet.add(variant);
-					}
-				}
-
-				if (rowStatusShort) {
-					keySet.add(rowStatusShort);
-					for (const variant of buildStatusLabelVariants(rowStatusShort)) {
-						keySet.add(variant);
-					}
-				}
-			}
-
-			byCode.set(groupCode, keySet);
-		}
-
-		return byCode;
-	}, [orderedRecommendationGroups, visibleRecommendationRows]);
 
 	const filteredRecommendationRows = useMemo(() => {
 		if (selectedRecommendationStatuses.length === 0) {
@@ -1542,32 +1457,8 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 										(filter) => filter.stageCode === status.stageCode,
 									);
 									const statusColor = STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length];
-									const statusLabelVariants = buildStatusLabelVariants(status.stageLabel);
-									const rowDerivedStatusKeys = Array.from(
-										inspectionStatusKeysByStageCode.get(
-											status.stageCode.trim().toLowerCase(),
-										) ?? [],
-									);
-									const rowDerivedLabelStatusKeys = Array.from(
-										new Set(
-											statusLabelVariants.flatMap((variant) =>
-												Array.from(
-													inspectionStatusKeysByStageLabel.get(
-														variant.trim().toLowerCase(),
-													) ?? [],
-												),
-											),
-										),
-									);
 									const statusLegendColor = resolveStatusBackgroundColor(
-										[
-											status.stageCode,
-											status.stageLabel,
-											normalizePolishLabel(status.stageLabel),
-											...statusLabelVariants,
-											...rowDerivedStatusKeys,
-											...rowDerivedLabelStatusKeys,
-										],
+										[status.stageCode, status.stageLabel],
 										inspectionStatusStyleByCode,
 									);
 									const isZero = status.count === 0;
@@ -2029,23 +1920,11 @@ export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
 												(filter) => filter.stageGroupCode === group.stageGroupCode,
 											);
 											const statusColor = STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length];
-											const groupLabelVariants = buildStatusLabelVariants(group.stageGroupLabel);
-											const groupShortLabelVariants = buildStatusLabelVariants(
-												group.stageGroupShortLabel,
-											);
-											const rowDerivedStatusKeys = Array.from(
-												recommendationStatusKeysByGroupCode.get(
-													group.stageGroupCode.trim().toLowerCase(),
-												) ?? [],
-											);
 											const statusLegendColor = resolveStatusBackgroundColor(
 												[
 													group.stageGroupCode,
 													group.stageGroupShortLabel,
 													group.stageGroupLabel,
-													...groupShortLabelVariants,
-													...groupLabelVariants,
-													...rowDerivedStatusKeys,
 												],
 												recommendationStatusStyleByCode,
 											);
