@@ -1,3 +1,4 @@
+-- Aktywni zalogowani użytkownicy (TYLKO aktywne konta)
 SELECT
   u.id AS user_id,
   u.login,
@@ -10,5 +11,6 @@ FROM auth_sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.revoked_at IS NULL
   AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%S', 'now')
+  AND u.aktywny = 1
 GROUP BY u.id, u.login, u.imie, u.nazwisko, u.rola_id
 ORDER BY latest_expires_at DESC;
