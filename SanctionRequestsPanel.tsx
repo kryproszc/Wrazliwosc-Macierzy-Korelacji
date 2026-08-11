@@ -3101,6 +3101,11 @@ export function SanctionRequestsPanel({
 
 		if (!selectedInspectionOption) {
 			setForm((prev) => {
+				const hasInspectionSelection = prev.inspectionId.trim().length > 0;
+				if (hasInspectionSelection) {
+					return prev;
+				}
+
 				const nextInspectionTeamIds = isInspectionTeamSelectionManual
 					? prev.inspectionTeamIds
 					: [];
