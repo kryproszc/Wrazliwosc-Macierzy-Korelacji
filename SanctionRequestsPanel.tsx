@@ -1,1424 +1,2434 @@
 "use client";
 
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import {
-	BarChart3,
-	BadgeAlert,
-	BookMarked,
-	CalendarDays,
-	ClipboardList,
-	Clock3,
-	Database,
-	FileText,
-	FolderOpen,
-	Gavel,
-	House,
-	KeyRound,
-	ListChecks,
-	LogOut,
-	Menu,
-	ScrollText,
-	Settings,
-	ShieldCheck,
-	Timer,
-	Users,
-	type LucideIcon,
-} from "lucide-react";
-import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+        Cell,
+        Pie,
+        PieChart,
+        ResponsiveContainer,
+        Tooltip,
+} from "recharts";
 
-import {
-	PANEL_MODE_CONFIG,
-	getDefaultMenuItemId,
-} from "@/app/_components/home-tabs/config";
-import { renderTabContent } from "@/app/_components/home-tabs/content-registry";
-import type {
-	AuthRole,
-	AuthUser,
-	MenuSection,
-	PanelMode,
-} from "@/app/_components/home-tabs/types";
-import {
-	clearStoredAuthSession,
-	getStoredAuthSession,
-	getStoredAuthToken,
-	setStoredAuthSession,
-} from "@/features/auth/session";
-import type { LoginUser } from "@/features/auth/types";
+import { getStoredAuthSession } from "@/features/auth/session";
 import { normalizeAuthRole } from "@/features/auth/types";
-import { useInactivityTimeout } from "@/shared/hooks/useInactivityTimeout";
+import { fetchDictionaryEntries } from "@/features/dictionaries/api";
+import {
+        fetchInspectionsDetailedReport,
+        fetchInspectionsStageSummary,
+        fetchRecommendationsDetailedReport,
+        fetchRecommendationsStageSummary,
+} from "@/features/reports/api";
+import { TableSurface } from "@/shared/components/table/TableSurface";
+import { formatDatesInDisplayText } from "@/shared/utils/date";
+import type {
+        ReportInspectionDetailedRow,
+        ReportRecommendationDetailedRow,
+        ReportsRecommendationsStageSummaryResponse,
+        ReportsInspectionsStageSummaryResponse,
+} from "@/features/reports/types";
 
-const GLOBAL_INACTIVITY_TIMEOUT_MS = 20 * 60_000;
-const GLOBAL_INACTIVITY_WARNING_MS = 60_000;
+type WelcomeStartPanelProps = {
+        operatorLogin: string;
+};
+
+type DashboardTooltipState = {
+	text: string;
+	x: number;
+	y: number;
+};
+
 const DASHBOARD_OPEN_INSPECTION_EVENT = "dashboard:open-inspection";
+const DASHBOARD_OPEN_INSPECTION_CODE_KEY = "triangle.dashboard.openInspectionCode";
 const DASHBOARD_OPEN_RECOMMENDATION_EVENT = "dashboard:open-recommendation";
-const DASHBOARD_OPEN_SANCTION_REQUEST_EVENT = "dashboard:open-sanction-request";
-const DASHBOARD_OPEN_BINDING_DECISION_EVENT = "dashboard:open-binding-decision";
-const OBSERVER_ROLE_ID = 4;
-const MANAGEMENT_DICTIONARIES_READ_PERMISSION =
-	"management.dictionaries.read";
-const MANAGEMENT_DICTIONARIES_WRITE_PERMISSION =
-	"management.dictionaries.write";
+const DASHBOARD_OPEN_RECOMMENDATION_CODE_KEY =
+        "triangle.dashboard.openRecommendationCode";
+const DASHBOARD_ACTIVE_TOP_SECTION_KEY = "triangle.dashboard.activeTopSection";
+const DASHBOARD_SELECTED_INSPECTION_STAGE_FILTERS_KEY =
+        "triangle.dashboard.selectedInspectionStageFilters";
+const DASHBOARD_INSPECTION_SUMMARY_COLLAPSED_KEY =
+	"triangle.dashboard.inspectionSummaryCollapsed";
+const DASHBOARD_RECOMMENDATION_SUMMARY_COLLAPSED_KEY =
+	"triangle.dashboard.recommendationSummaryCollapsed";
+const DASHBOARD_SELECTED_RECOMMENDATION_STATUSES_KEY =
+        "triangle.dashboard.selectedRecommendationStatuses";
+const INSPECTION_STATUS_SCROLL_THRESHOLD = 12;
+const INSPECTION_STATUS_VISIBLE_ROWS = 12;
+const INSPECTION_STATUS_ESTIMATED_ROW_HEIGHT_PX = 33;
+const INSPECTION_STATUS_LIST_MAX_HEIGHT_PX =
+	INSPECTION_STATUS_VISIBLE_ROWS * INSPECTION_STATUS_ESTIMATED_ROW_HEIGHT_PX;
+const RECOMMENDATION_STATUS_SCROLL_THRESHOLD = 12;
+const RECOMMENDATION_STATUS_VISIBLE_ROWS = 12;
+const RECOMMENDATION_STATUS_ESTIMATED_ROW_HEIGHT_PX = 33;
+const RECOMMENDATION_STATUS_LIST_MAX_HEIGHT_PX =
+	RECOMMENDATION_STATUS_VISIBLE_ROWS * RECOMMENDATION_STATUS_ESTIMATED_ROW_HEIGHT_PX;
+const DASHBOARD_MAX_ROW_HEIGHT_PX = 92;
+// Ustal ręczną kolejność statusów po kodzie etapu (kod_pozycji).
+// Przykład: ["PLAN", "PRZYG", "TRWA"]
+const INSPECTION_STAGE_ORDER_BY_CODE: string[] = [];
+const STAGE_OVERVIEW_COLORS = [
+	"#b4534b", // muted red
+	"#c96a4b", // terracotta
+	"#d48746", // muted orange
+	"#d9a441", // amber
+	"#c8b24a", // olive yellow
+	"#8aa652", // moss green
+	"#4f9a70", // soft green
+	"#2f8f8a", // teal
+	"#3f86b8", // muted blue
+	"#5e73b8", // indigo blue
+] as const;
+const ENABLE_DASHBOARD_DEBUG_LOGS = false;
 
-type PasswordLoginResponse = {
-	ok?: boolean;
-	token?: string;
-	expiresAt?: string;
-	user?: LoginUser;
+function toTeamCodeListFromValue(value: string) {
+	return value
+		.split(/[;,]/)
+		.map((item) => item.trim())
+		.filter((item) => item && item !== "-");
+}
+
+function toUniqueTeamCodes(
+	teamCodes: string[],
+	teamCodesText: string,
+	leaderTeamCode: string,
+) {
+	const preferred = teamCodes
+		.map((item) => String(item ?? "").trim())
+		.filter((item) => item && item !== "-");
+
+	const fallback = preferred.length > 0 ? preferred : toTeamCodeListFromValue(teamCodesText);
+	const withLeaderFallback =
+		fallback.length > 0
+			? fallback
+			: (() => {
+				const leader = String(leaderTeamCode ?? "").trim();
+				return leader && leader !== "-" ? [leader] : [];
+			})();
+
+	return Array.from(new Set(withLeaderFallback));
+}
+
+type InspectionStatusStyle = {
+	kolor: string | null;
+	odcien: number | null;
+	intensywnosc: number | null;
 };
 
-type MeTokenResponse = {
-	ok?: boolean;
-	user?: LoginUser;
+const STATUS_PALETTE_HUE_SAT: Record<string, { hue: number; saturation: number }> = {
+	emerald: { hue: 160, saturation: 84 },
+	green: { hue: 142, saturation: 71 },
+	teal: { hue: 173, saturation: 80 },
+	lime: { hue: 83, saturation: 86 },
+	sky: { hue: 199, saturation: 95 },
+	cyan: { hue: 188, saturation: 94 },
+	blue: { hue: 221, saturation: 83 },
+	indigo: { hue: 239, saturation: 84 },
+	rose: { hue: 350, saturation: 89 },
+	red: { hue: 0, saturation: 84 },
+	pink: { hue: 330, saturation: 81 },
+	fuchsia: { hue: 292, saturation: 84 },
+	yellow: { hue: 55, saturation: 96 },
+	amber: { hue: 43, saturation: 96 },
+	orange: { hue: 24, saturation: 92 },
 };
 
-type PasswordLoginErrorDetail = {
-	code: string;
-	message: string;
-	attemptsRemaining: number | null;
-	maxAttempts: number | null;
-	lockoutMinutes: number | null;
-	lockedUntil: string;
-	retryAfterSeconds: number | null;
+const STATUS_SHADE_TO_LIGHTNESS: Record<number, number> = {
+	50: 97,
+	100: 93,
+	200: 86,
+	300: 76,
+	400: 65,
+	500: 54,
+	600: 45,
+	700: 37,
+	800: 30,
+	900: 23,
+	950: 14,
 };
 
-function toNonNegativeInteger(value: unknown) {
-	if (typeof value === "number" && Number.isFinite(value)) {
-		return value >= 0 ? Math.trunc(value) : null;
+function resolveStatusBackgroundColorByCode(
+	statusCode: string | null | undefined,
+	statusStyleByCode: Record<string, InspectionStatusStyle>,
+) {
+	const normalizedCode = normalizeStatusLookupKey(statusCode);
+	if (!normalizedCode) {
+		return "rgb(255 255 255 / 1)";
 	}
 
-	if (typeof value === "string") {
-		const parsed = Number(value.trim());
-		if (Number.isFinite(parsed) && parsed >= 0) {
-			return Math.trunc(parsed);
+	const style = statusStyleByCode[normalizedCode];
+	if (!style) {
+		return "rgb(255 255 255 / 1)";
+	}
+
+	const palette = STATUS_PALETTE_HUE_SAT[String(style.kolor ?? "").trim().toLowerCase()];
+	if (!palette) {
+		return "rgb(255 255 255 / 1)";
+	}
+
+	const shade = Number.isFinite(style.odcien)
+		? Math.round(Number(style.odcien))
+		: 200;
+	const lightness = STATUS_SHADE_TO_LIGHTNESS[shade] ?? STATUS_SHADE_TO_LIGHTNESS[200];
+	const opacity = Number.isFinite(style.intensywnosc)
+		? Math.max(0, Math.min(100, Number(style.intensywnosc))) / 100
+		: 0.75;
+
+	return `hsl(${palette.hue} ${palette.saturation}% ${lightness}% / ${opacity})`;
+}
+
+function resolveStatusBackgroundColor(
+	statusCodes: Array<string | null | undefined>,
+	statusStyleByCode: Record<string, InspectionStatusStyle>,
+) {
+	for (const statusCode of statusCodes) {
+		const color = resolveStatusBackgroundColorByCode(statusCode, statusStyleByCode);
+		if (color !== "rgb(255 255 255 / 1)") {
+			return color;
 		}
 	}
 
-	return null;
-}
+	const ignoredWords = new Set(["a", "do", "i", "na", "po", "w", "z"]);
+	const normalizedCandidates = statusCodes
+		.map((statusCode) => normalizeStatusLookupKey(statusCode))
+		.filter(Boolean);
 
-function formatRetryAfterLabel(retryAfterSeconds: number) {
-	const totalSeconds = Math.max(0, Math.trunc(retryAfterSeconds));
-	const minutes = Math.floor(totalSeconds / 60);
-	const seconds = totalSeconds % 60;
-
-	if (minutes > 0 && seconds > 0) {
-		return `${minutes} min ${seconds} s`;
-	}
-
-	if (minutes > 0) {
-		return `${minutes} min`;
-	}
-
-	return `${seconds} s`;
-}
-
-function formatLockedUntilLabel(lockedUntilRaw: string) {
-	const parsed = new Date(lockedUntilRaw);
-	if (Number.isNaN(parsed.getTime())) {
-		return "";
-	}
-
-	return parsed.toLocaleString("pl-PL", {
-		year: "numeric",
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
-}
-
-function formatLockedUntilHourMinuteLabel(lockedUntilRaw: string) {
-	const parsed = new Date(lockedUntilRaw);
-	if (Number.isNaN(parsed.getTime())) {
-		return "";
-	}
-
-	return parsed.toLocaleTimeString("pl-PL", {
-		hour: "2-digit",
-		minute: "2-digit",
-	});
-}
-
-function resolveLockedUntilForMessage(detail: PasswordLoginErrorDetail) {
-	if (detail.lockedUntil) {
-		return detail.lockedUntil;
-	}
-
-	const minutesToAdd =
-		detail.lockoutMinutes !== null && detail.lockoutMinutes > 0
-			? detail.lockoutMinutes
-			: 15;
-	const fallbackDate = new Date(Date.now() + minutesToAdd * 60 * 1000);
-	return fallbackDate.toISOString();
-}
-
-function buildAccountLockedNotice(detail: PasswordLoginErrorDetail) {
-	const effectiveLockoutMinutes =
-		detail.lockoutMinutes !== null && detail.lockoutMinutes > 0
-			? detail.lockoutMinutes
-			: 15;
-	const resolvedLockedUntil = resolveLockedUntilForMessage(detail);
-	const lockedUntilHourMinute = formatLockedUntilHourMinuteLabel(resolvedLockedUntil);
-
-	if (lockedUntilHourMinute) {
-		return `Konto zostało zablokowane na ${effectiveLockoutMinutes} minut.\nBlokada zostanie zwolniona o godzinie: ${lockedUntilHourMinute}.`;
-	}
-
-	return `Konto zostało zablokowane na ${effectiveLockoutMinutes} minut.`;
-}
-
-function buildInvalidCredentialsMessage(detail: PasswordLoginErrorDetail) {
-	const recoveryHint =
-		"\nRozważ nadanie nowego hasła. Kliknij \"Nie pamiętam hasła\".";
-
-	if (detail.attemptsRemaining !== null) {
-		if (detail.attemptsRemaining === 0) {
-			return buildAccountLockedNotice(detail);
+	for (const candidate of normalizedCandidates) {
+		const candidateWords = candidate
+			.replace(/\b(odp)\.?\b/g, "odpowiedz")
+			.split(" ")
+			.filter((word) => word.length > 2 && !ignoredWords.has(word));
+		if (candidateWords.length < 2) {
+			continue;
 		}
 
-		const isLastAttemptBeforeLock = detail.attemptsRemaining === 1;
-		const suffix = isLastAttemptBeforeLock ? recoveryHint : "";
-
-		if (detail.maxAttempts !== null) {
-			return `Nieprawidłowy login lub hasło. Pozostało prób: ${detail.attemptsRemaining}/${detail.maxAttempts}.${suffix}`;
-		}
-
-		return `Nieprawidłowy login lub hasło. Pozostało prób: ${detail.attemptsRemaining}.${suffix}`;
-	}
-
-	return detail.message || "Nieprawidłowy login lub hasło.";
-}
-
-function buildLoginLockedMessage(detail: PasswordLoginErrorDetail) {
-	if (detail.retryAfterSeconds !== null) {
-		return `Logowanie zostało tymczasowo zablokowane. Spróbuj ponownie za ${formatRetryAfterLabel(detail.retryAfterSeconds)}.`;
-	}
-
-	if (detail.lockedUntil) {
-		const lockedUntilLabel = formatLockedUntilLabel(detail.lockedUntil);
-		if (lockedUntilLabel) {
-			return `Logowanie zostało tymczasowo zablokowane. Spróbuj ponownie po ${lockedUntilLabel}.`;
-		}
-	}
-
-	if (detail.lockoutMinutes !== null) {
-		return `Logowanie zostało tymczasowo zablokowane. Spróbuj ponownie za około ${detail.lockoutMinutes} min.`;
-	}
-
-	return detail.message || "Logowanie zostało tymczasowo zablokowane. Spróbuj ponownie później.";
-}
-
-async function readPasswordLoginErrorDetail(
-	response: Response,
-): Promise<PasswordLoginErrorDetail | null> {
-	const contentType = response.headers.get("content-type") ?? "";
-	if (!contentType.includes("application/json")) {
-		return null;
-	}
-
-	try {
-		const payload = (await response.json()) as {
-			detail?: unknown;
-			message?: unknown;
-		};
-		const detailSource = payload.detail;
-		const detailRecord =
-			detailSource && typeof detailSource === "object" && !Array.isArray(detailSource)
-				? (detailSource as Record<string, unknown>)
-				: null;
-		const fallbackMessage =
-			typeof payload.message === "string" ? payload.message.trim() : "";
-
-		return {
-			code:
-				typeof detailRecord?.code === "string"
-					? detailRecord.code.trim()
-					: "",
-			message:
-				typeof detailRecord?.message === "string"
-					? detailRecord.message.trim()
-					: fallbackMessage,
-			attemptsRemaining: toNonNegativeInteger(detailRecord?.attemptsRemaining),
-			maxAttempts: toNonNegativeInteger(detailRecord?.maxAttempts),
-			lockoutMinutes: toNonNegativeInteger(detailRecord?.lockoutMinutes),
-			lockedUntil:
-				typeof detailRecord?.lockedUntil === "string"
-					? detailRecord.lockedUntil.trim()
-					: "",
-			retryAfterSeconds: toNonNegativeInteger(detailRecord?.retryAfterSeconds),
-		};
-	} catch {
-		return null;
-	}
-}
-
-function mapLoginUserToAuthUser(user: LoginUser): AuthUser {
-	const effectivePermissions = Array.isArray(user.effectivePermissions)
-		? user.effectivePermissions
-				.filter((permission): permission is string => typeof permission === "string")
-				.map((permission) => permission.trim())
-				.filter(Boolean)
-		: [];
-	const isObserver =
-		typeof user.accountType === "string" &&
-		user.accountType.trim().toLowerCase() === "observer";
-
-	return {
-		...user,
-		effectivePermissions,
-		role: isObserver ? "external_user" : normalizeAuthRole(user.rola),
-	};
-}
-
-function hasPermission(permissions: Set<string>, permission: string) {
-	return permissions.has(permission);
-}
-
-function getVisibleMenuSections(
-	panelMode: PanelMode,
-	role: AuthRole,
-	roleId: number | null,
-	canViewTimeReports: boolean,
-	canViewOwnTimeReport: boolean,
-	effectivePermissions: Set<string>,
-): MenuSection[] {
-	const baseSections = PANEL_MODE_CONFIG[panelMode].sections;
-	if (panelMode === "registry") {
-		const usePermissionBasedRegistryVisibility =
-			effectivePermissions.size > 0;
-
-		if (usePermissionBasedRegistryVisibility) {
-			const visibleSections = baseSections
-				.map((section) => ({
-					...section,
-					items: section.items.filter((item) => {
-						if (item.id === "inspections") {
-							return hasPermission(
-								effectivePermissions,
-								"registry.inspections.read",
-							);
-						}
-
-						if (item.id === "recommendations") {
-							return hasPermission(
-								effectivePermissions,
-								"registry.recommendations.read",
-							);
-						}
-
-						if (item.id === "binding_decisions") {
-							return hasPermission(
-								effectivePermissions,
-								"registry.obligating_decisions.read",
-							);
-						}
-
-						if (item.id === "sanction_requests") {
-							return hasPermission(
-								effectivePermissions,
-								"registry.risk_exposure.read",
-							);
-						}
-
-						if (item.id === "reports") {
-							return hasPermission(
-								effectivePermissions,
-								"reports.executed_inspections.read",
-							);
-						}
-
-						if (item.id === "report_protocol_time") {
-							return hasPermission(
-								effectivePermissions,
-								"reports.protocol_time.read",
-							);
-						}
-
-						if (item.id === "report_statement_time") {
-							return hasPermission(
-								effectivePermissions,
-								"reports.report_time.read",
-							);
-						}
-
-						if (item.id === "start") {
-							return roleId !== OBSERVER_ROLE_ID;
-						}
-
-						if (item.id === "report_own_time") {
-							return false;
-						}
-
-						return true;
-					}),
-				}))
-				.filter((section) => section.items.length > 0);
+		for (const storedKey of Object.keys(statusStyleByCode)) {
+			const storedWords = storedKey
+				.replace(/\b(odp)\.?\b/g, "odpowiedz")
+				.split(" ")
+				.filter((word) => word.length > 2 && !ignoredWords.has(word));
+			const matchingWords = candidateWords.filter((word) => storedWords.includes(word));
 
 			if (
-				role === "inspector" &&
-				hasPermission(
-					effectivePermissions,
-					MANAGEMENT_DICTIONARIES_READ_PERMISSION,
-				)
+				matchingWords.length >= 2 &&
+				matchingWords.length / Math.min(candidateWords.length, storedWords.length) >= 0.75
 			) {
-				visibleSections.push({
-					id: "dictionaries",
-					label: "Słowniki",
-					icon: "tools",
-					items: [{ id: "dictionaries", label: "Słowniki" }],
-				});
-			}
-
-			return visibleSections;
-		}
-
-		const visibleSections = baseSections
-			.map((section) => ({
-				...section,
-				items: section.items.filter((item) => {
-						if (item.id === "start") {
-							return roleId !== OBSERVER_ROLE_ID;
-						}
-
-					if (
-						item.id === "report_protocol_time" ||
-						item.id === "report_statement_time"
-					) {
-						return canViewTimeReports;
-					}
-
-					if (item.id === "report_own_time") {
-						return role === "inspector" && canViewOwnTimeReport;
-					}
-
-					return true;
-				}),
-			}))
-			.filter((section) => section.items.length > 0);
-
-		return visibleSections;
-	}
-
-	if (panelMode !== "management") {
-		return baseSections;
-	}
-
-	const usePermissionBasedManagementVisibility =
-		effectivePermissions.size > 0;
-
-	if (usePermissionBasedManagementVisibility) {
-		return baseSections
-			.map((section) => ({
-				...section,
-				items: section.items.filter((item) => {
-					if (item.id === "email") {
-						return role === "director";
-					}
-
-					if (item.id === "dictionaries") {
-						return hasPermission(
-							effectivePermissions,
-							MANAGEMENT_DICTIONARIES_READ_PERMISSION,
-						);
-					}
-
-					if (role === "inspector" || role === "external_user") {
-						return false;
-					}
-
-					if (role === "team_lead") {
-						return (
-							item.id !== "teams" &&
-							item.id !== "schedules" &&
-							item.id !== "external_users"
-						);
-					}
-
-					return true;
-				}),
-			}))
-			.filter((section) => section.items.length > 0);
-	}
-
-	if (role !== "team_lead") {
-		return baseSections
-			.map((section) => ({
-				...section,
-				items: section.items.filter((item) => {
-					if (item.id === "email") {
-						return role === "director";
-					}
-
-					return true;
-				}),
-			}))
-			.filter((section) => section.items.length > 0);
-	}
-
-	return baseSections
-		.map((section) => ({
-			...section,
-			items: section.items.filter(
-				(item) =>
-					item.id !== "email" &&
-					item.id !== "teams" &&
-					item.id !== "schedules" &&
-					item.id !== "external_users",
-			),
-		}))
-		.filter((section) => section.items.length > 0);
-}
-
-function getSectionIcon(section: MenuSection) {
-	if (section.id === "start") {
-		return House;
-	}
-
-	if (section.id === "registers") {
-		return Database;
-	}
-
-	if (section.id === "tools") {
-		return BarChart3;
-	}
-
-	if (section.id === "dictionaries") {
-		return BookMarked;
-	}
-
-	if (section.id === "management") {
-		return Settings;
-	}
-
-	return FolderOpen;
-}
-
-function getMenuItemIcon(itemId: string): LucideIcon {
-	if (itemId === "start") {
-		return House;
-	}
-
-	if (itemId === "inspections") {
-		return ClipboardList;
-	}
-
-	if (itemId === "recommendations") {
-		return ListChecks;
-	}
-
-	if (itemId === "binding_decisions") {
-		return Gavel;
-	}
-
-	if (itemId === "sanction_requests") {
-		return BadgeAlert;
-	}
-
-	if (itemId === "reports") {
-		return FileText;
-	}
-
-	if (itemId === "report_protocol_time") {
-		return Timer;
-	}
-
-	if (itemId === "report_statement_time") {
-		return Clock3;
-	}
-
-	if (itemId === "report_own_time") {
-		return Clock3;
-	}
-
-	if (itemId === "dictionaries") {
-		return BookMarked;
-	}
-
-	if (itemId === "teams" || itemId === "users") {
-		return Users;
-	}
-
-	if (itemId === "schedules") {
-		return CalendarDays;
-	}
-
-	if (itemId === "logs") {
-		return ScrollText;
-	}
-
-	return FolderOpen;
-}
-
-export function HomeTabs() {
-	const router = useRouter();
-	const pathname = usePathname();
-	const companyShortName = "UPZ";
-	const [initialSession] = useState(() => getStoredAuthSession());
-
-	const [isCheckingSession, setIsCheckingSession] = useState(
-		() => initialSession !== null,
-	);
-	const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-	const [isDesktopSidebarExpanded, setIsDesktopSidebarExpanded] = useState(true);
-	const [panelMode, setPanelMode] = useState<PanelMode>("registry");
-	const [selectedItemId, setSelectedItemId] = useState<string>(
-		getDefaultMenuItemId("registry"),
-	);
-	const [authUser, setAuthUser] = useState<AuthUser | null>(() =>
-		initialSession ? mapLoginUserToAuthUser(initialSession.user) : null,
-	);
-	const [loginInput, setLoginInput] = useState("");
-	const [passwordInput, setPasswordInput] = useState("");
-	const [isLoginSubmitting, setIsLoginSubmitting] = useState(false);
-	const [loginError, setLoginError] = useState<string | null>(null);
-
-	useEffect(() => {
-		const session = initialSession;
-		if (!session) {
-			setIsCheckingSession(false);
-			return;
-		}
-
-		const bootstrapSession = async () => {
-			try {
-				const response = await fetch("/api/auth/me-token", {
-					method: "GET",
-					headers: {
-						"Content-Type": "application/json",
-						Authorization: `Bearer ${session.token}`,
-					},
-					cache: "no-store",
-				});
-
-				if (!response.ok) {
-					clearStoredAuthSession();
-					setAuthUser(null);
-					return;
+				const color = resolveStatusBackgroundColorByCode(storedKey, statusStyleByCode);
+				if (color !== "rgb(255 255 255 / 1)") {
+					return color;
 				}
-
-				const payload = (await response.json()) as MeTokenResponse;
-				if (!payload.user) {
-					clearStoredAuthSession();
-					setAuthUser(null);
-					return;
-				}
-
-				setStoredAuthSession({
-					token: session.token,
-					expiresAt: session.expiresAt,
-					user: payload.user,
-				});
-				setAuthUser(mapLoginUserToAuthUser(payload.user));
-			} catch {
-				clearStoredAuthSession();
-				setAuthUser(null);
-			} finally {
-				setIsCheckingSession(false);
 			}
-		};
-
-		void bootstrapSession();
-	}, [initialSession]);
-
-	useEffect(() => {
-		if (isCheckingSession) {
-			return;
 		}
+	}
 
-		if (!authUser && pathname !== "/login") {
-			router.replace("/login");
-			return;
-		}
+	return "rgb(255 255 255 / 1)";
+}
 
-		if (authUser && pathname === "/login") {
-			router.replace("/");
-		}
-	}, [authUser, isCheckingSession, pathname, router]);
+function normalizeStatusLookupKey(value: string | null | undefined) {
+	return String(value ?? "")
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, " ");
+}
 
-	const authRole = authUser?.role ?? "inspector";
-	const authRoleId = authUser?.rolaId ?? null;
-	const isObserver = authUser?.accountType === "observer";
-	const canViewTimeReports = authUser?.canViewTimeReports ?? false;
-	const canViewOwnTimeReport = authUser?.canViewOwnTimeReport ?? false;
-	const effectivePermissions = useMemo(
-		() => new Set(authUser?.effectivePermissions ?? []),
-		[authUser?.effectivePermissions],
+function getStoredDashboardActiveSection(): "inspections" | "recommendations" {
+        if (typeof window === "undefined") {
+                return "inspections";
+        }
+
+        const saved = window.sessionStorage.getItem(DASHBOARD_ACTIVE_TOP_SECTION_KEY);
+        return saved === "recommendations" ? "recommendations" : "inspections";
+}
+
+function getStoredInspectionStageFilters(): StageFilter[] {
+        if (typeof window === "undefined") {
+                return [];
+        }
+
+        const raw = window.sessionStorage.getItem(
+                DASHBOARD_SELECTED_INSPECTION_STAGE_FILTERS_KEY,
+        );
+        if (!raw) {
+                return [];
+        }
+
+        try {
+                const parsed = JSON.parse(raw);
+                if (!Array.isArray(parsed)) {
+                        return [];
+                }
+
+                return parsed
+                        .map((item) => {
+                                if (!item || typeof item !== "object") {
+                                        return null;
+                                }
+
+                                const record = item as Record<string, unknown>;
+                                const stageCode =
+                                        typeof record.stageCode === "string"
+                                                ? record.stageCode
+                                                : typeof record.stageGroupCode === "string"
+                                                        ? record.stageGroupCode
+                                                        : typeof record.stageSubgroupCode === "string"
+                                                                ? record.stageSubgroupCode
+                                                                : "";
+                                const stageLabel =
+                                        typeof record.stageLabel === "string"
+                                                ? record.stageLabel
+                                                : typeof record.stageGroupLabel === "string"
+                                                        ? record.stageGroupLabel
+                                                        : typeof record.stageSubgroupLabel === "string"
+                                                                ? record.stageSubgroupLabel
+                                                                : "";
+
+                                if (!stageCode.trim() || !stageLabel.trim()) {
+                                        return null;
+                                }
+
+                                return {
+                                        stageCode,
+                                        stageLabel,
+                                };
+                        })
+                        .filter((item): item is StageFilter => item !== null);
+        } catch {
+                window.sessionStorage.removeItem(DASHBOARD_SELECTED_INSPECTION_STAGE_FILTERS_KEY);
+                return [];
+        }
+}
+
+function getStoredInspectionSummaryCollapsed() {
+	if (typeof window === "undefined") {
+		return false;
+	}
+
+	return window.sessionStorage.getItem(DASHBOARD_INSPECTION_SUMMARY_COLLAPSED_KEY) === "1";
+}
+
+function getStoredRecommendationStatusFilters(): RecommendationStatusFilter[] {
+        if (typeof window === "undefined") {
+                return [];
+        }
+
+        const raw = window.sessionStorage.getItem(
+                DASHBOARD_SELECTED_RECOMMENDATION_STATUSES_KEY,
+        );
+        if (!raw) {
+                return [];
+        }
+
+        try {
+                const parsed = JSON.parse(raw);
+                if (!Array.isArray(parsed)) {
+                        return [];
+                }
+
+                return parsed
+                        .filter(
+                                (item) =>
+                                        item &&
+                                        typeof item === "object" &&
+                                        typeof (item as RecommendationStatusFilter).stageGroupCode === "string" &&
+                                        typeof (item as RecommendationStatusFilter).stageGroupLabel === "string",
+                        )
+                        .map((item) => ({
+                                stageGroupCode: (item as RecommendationStatusFilter).stageGroupCode,
+                                stageGroupLabel: (item as RecommendationStatusFilter).stageGroupLabel,
+                        }));
+        } catch {
+                window.sessionStorage.removeItem(DASHBOARD_SELECTED_RECOMMENDATION_STATUSES_KEY);
+                return [];
+        }
+}
+
+function getStoredRecommendationSummaryCollapsed() {
+	if (typeof window === "undefined") {
+		return false;
+	}
+
+	return (
+		window.sessionStorage.getItem(DASHBOARD_RECOMMENDATION_SUMMARY_COLLAPSED_KEY) ===
+		"1"
 	);
-	const isDirector = authRole === "director";
-	const isTeamLead = authRole === "team_lead";
-	const canReadDictionaries = hasPermission(
-		effectivePermissions,
-		MANAGEMENT_DICTIONARIES_READ_PERMISSION,
+}
+
+function normalizePolishLabel(label: string) {
+        return label
+                .replace(/inspekcja\b/gi, "inspekcja")
+                .replace(/inspekcji\b/gi, "inspekcji")
+					.replace(/przed inspekcja\b/gi, "przed inspekcją")
+					.replace(/w trakcie inspekcji\b/gi, "w trakcie inspekcji")
+					.replace(/po inspekcji\b/gi, "po inspekcji")
+					.replace(/rekomendacje\b/gi, "rekomendacje")
+					.replace(/wplynely\b/gi, "wpłynęły")
+					.replace(/wplynela\b/gi, "wpłynęła")
+                .replace(/zastrzezenia\b/gi, "zastrzeżenia")
+                .replace(/odpowiedz\b/gi, "odpowiedź")
+                .replace(/zamkniete\b/gi, "zamknięte")
+					.replace(/piszemy zalecenia\b/gi, "piszemy zalecenia")
+					.replace(/pismo ustalenia\b/gi, "pismo ustalenia");
+}
+
+function getInspectionCountLabel(count: number) {
+	const absolute = Math.abs(Math.trunc(count));
+	const mod10 = absolute % 10;
+	const mod100 = absolute % 100;
+
+	if (absolute === 1) {
+		return "Inspekcja";
+	}
+
+	if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+		return "Inspekcje";
+	}
+
+	return "Inspekcji";
+}
+
+function renderDonutStatusTooltip({
+	active,
+	payload,
+}: {
+	active?: boolean;
+	payload?: Array<{ payload?: { stageGroupLabel?: string } }>;
+}) {
+	if (!active || !payload || payload.length === 0) {
+		return null;
+	}
+
+	const label = String(payload[0]?.payload?.stageGroupLabel ?? "Status").trim();
+
+	return (
+		<div
+			className="max-w-[220px] whitespace-normal break-words rounded-[10px] border border-[#cbd5e1] bg-white px-3 py-2 text-slate-800 text-sm shadow-[0_8px_20px_rgba(2,8,23,0.08)]"
+		>
+			{label || "Status"}
+		</div>
 	);
-	const canWriteDictionariesByPermission = hasPermission(
-		effectivePermissions,
-		MANAGEMENT_DICTIONARIES_WRITE_PERMISSION,
+}
+
+function shouldHideInspectionStageStatus(stageLabel: string) {
+        const normalized = normalizePolishLabel(stageLabel).trim().toLowerCase();
+        if (!normalized) {
+                return false;
+        }
+
+        return normalized.includes("zamknięte") || normalized.includes("nieprzypis");
+}
+
+function shouldHideRecommendationStatus(stageLabel: string) {
+	const normalized = normalizePolishLabel(stageLabel).trim().toLowerCase();
+	if (!normalized) {
+		return false;
+	}
+
+	return (
+		normalized.includes("zalecenia wykonano") ||
+		normalized.includes("nieprzypisany status") ||
+		normalized.includes("nieprzypisany")
 	);
-	const canEditDictionaries =
-		canWriteDictionariesByPermission &&
-		authRole !== "inspector" &&
-		authRole !== "external_user";
-	const canAccessManagement = isDirector || isTeamLead;
-	const isRegistryOnlyUser = !canAccessManagement;
+}
 
-	const menuSections = useMemo(
-		() =>
-			getVisibleMenuSections(
-				panelMode,
-				authRole,
-				authRoleId,
-				canViewTimeReports,
-				canViewOwnTimeReport,
-				effectivePermissions,
-			),
-		[
-			authRole,
-			authRoleId,
-			canViewOwnTimeReport,
-			canViewTimeReports,
-			effectivePermissions,
-			panelMode,
-		],
+function shortenDuplicatedStatusLabel(label: string) {
+        const normalized = String(label ?? "").trim();
+        if (!normalized || normalized === "-") {
+                return "-";
+        }
+
+        const separators = [/\s+i\s+/i, /\s*\/\s*/i, /\s*\|\s*/i, /\s*,\s*/i] as const;
+        for (const separator of separators) {
+                const parts = normalized
+                        .split(separator)
+                        .map((part) => part.trim())
+                        .filter(Boolean);
+
+                if (parts.length === 2) {
+                        const left = parts[0] ?? "";
+                        const right = parts[1] ?? "";
+                        const leftKey = left.toLowerCase().replace(/\s+/g, " ");
+                        const rightKey = right.toLowerCase().replace(/\s+/g, " ");
+                        if (leftKey && leftKey === rightKey) {
+                                return left;
+                        }
+                }
+        }
+
+        return normalized;
+}
+
+type StageFilter = {
+        stageCode: string;
+        stageLabel: string;
+};
+
+type StageOverviewSlice = {
+        stageGroupCode: string;
+        stageGroupLabel: string;
+        count: number;
+};
+
+type RecommendationStatusFilter = {
+        stageGroupCode: string;
+        stageGroupLabel: string;
+        stageGroupShortLabel?: string;
+};
+
+// Zmieniaj te wartości, aby ustawić startowe szerokości kolumn.
+const DEFAULT_COLUMN_WIDTHS = {
+	statusInspekcji: 240,
+	kodInspekcji: 160,
+	nazwaPodmiotu: 240,
+	rodzajPodmiotu: 230,
+	zakresInspekcji: 200,
+	inspektorKierujacy: 240,
+	zespol: 230,
+	poczatekInspekcji: 170,
+	koniecInspekcji: 170,
+} as const;
+
+// Zmieniaj te wartości, aby ustawić minimalne szerokości kolumn.
+const MIN_COLUMN_WIDTHS = {
+	statusInspekcji: 160,
+	kodInspekcji: 120,
+	nazwaPodmiotu: 220,
+	rodzajPodmiotu: 180,
+	zakresInspekcji: 200,
+	inspektorKierujacy: 180,
+	zespol: 180,
+	poczatekInspekcji: 140,
+	koniecInspekcji: 140,
+} as const;
+
+function resolveMinWidth(key: keyof typeof DEFAULT_COLUMN_WIDTHS) {
+	// If default width is smaller than configured minimum, honor the default.
+	return Math.min(MIN_COLUMN_WIDTHS[key], DEFAULT_COLUMN_WIDTHS[key]);
+}
+
+const TABLE_COLUMNS: Array<{
+	key: keyof ReportInspectionDetailedRow;
+	label: string;
+	defaultWidth: number;
+	minWidth: number;
+}> = [
+	{
+		key: "statusInspekcji",
+		label: "Status",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.statusInspekcji,
+		minWidth: resolveMinWidth("statusInspekcji"),
+	},
+	{
+		key: "kodInspekcji",
+		label: "Kod inspekcji",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.kodInspekcji,
+		minWidth: resolveMinWidth("kodInspekcji"),
+	},
+	{
+		key: "nazwaPodmiotu",
+		label: "Nazwa podmiotu",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.nazwaPodmiotu,
+		minWidth: resolveMinWidth("nazwaPodmiotu"),
+	},
+	{
+		key: "rodzajPodmiotu",
+		label: "Rodzaj podmiotu",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.rodzajPodmiotu,
+		minWidth: resolveMinWidth("rodzajPodmiotu"),
+	},
+	{
+		key: "zakresInspekcji",
+		label: "Zakres inspekcji",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.zakresInspekcji,
+		minWidth: resolveMinWidth("zakresInspekcji"),
+	},
+	{
+		key: "inspektorKierujacy",
+		label: "Inspektor kierujący",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.inspektorKierujacy,
+		minWidth: resolveMinWidth("inspektorKierujacy"),
+	},
+	{
+		key: "zespol",
+		label: "Zespoły",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.zespol,
+		minWidth: resolveMinWidth("zespol"),
+	},
+	{
+		key: "poczatekInspekcji",
+		label: "Początek inspekcji",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.poczatekInspekcji,
+		minWidth: resolveMinWidth("poczatekInspekcji"),
+	},
+	{
+		key: "koniecInspekcji",
+		label: "Koniec inspekcji",
+		defaultWidth: DEFAULT_COLUMN_WIDTHS.koniecInspekcji,
+		minWidth: resolveMinWidth("koniecInspekcji"),
+	},
+];
+
+const INITIAL_COLUMN_WIDTHS: Record<keyof ReportInspectionDetailedRow, number> =
+	TABLE_COLUMNS.reduce(
+		(accumulator, column) => ({
+			...accumulator,
+			[column.key]: column.defaultWidth,
+		}),
+		{} as Record<keyof ReportInspectionDetailedRow, number>,
 	);
 
-	const firstVisibleItemId = menuSections[0]?.items[0]?.id ?? "";
+const RECOMMENDATION_DEFAULT_COLUMN_WIDTHS = {
+	status: 200,
+	recommendationId: 140,
+	inspectionId: 140,
+	nazwaPodmiotu: 240,
+	zespol: 220,
+	dataZalecen: 150,
+	terminZalecen: 150,
+	terminWykonaniaZalecen: 230,
+	liczbaZalecen: 140,
+} as const;
 
-	useEffect(() => {
-		if (!authUser) {
-			return;
-		}
+const RECOMMENDATION_MIN_COLUMN_WIDTHS = {
+	status: 150,
+	recommendationId: 120,
+	inspectionId: 120,
+	nazwaPodmiotu: 180,
+	zespol: 170,
+	dataZalecen: 130,
+	terminZalecen: 130,
+	terminWykonaniaZalecen: 180,
+	liczbaZalecen: 120,
+} as const;
 
-		if (isRegistryOnlyUser && panelMode !== "registry") {
-			setPanelMode("registry");
-			return;
-		}
+function resolveRecommendationMinWidth(
+	key: keyof typeof RECOMMENDATION_DEFAULT_COLUMN_WIDTHS,
+) {
+	return Math.min(
+		RECOMMENDATION_MIN_COLUMN_WIDTHS[key],
+		RECOMMENDATION_DEFAULT_COLUMN_WIDTHS[key],
+	);
+}
 
-		const itemExists = menuSections.some((section) =>
-			section.items.some((item) => item.id === selectedItemId),
-		);
-		if (!itemExists && firstVisibleItemId) {
-			setSelectedItemId(firstVisibleItemId);
-		}
-	}, [
-		authUser,
-		firstVisibleItemId,
-		isRegistryOnlyUser,
-		menuSections,
-		panelMode,
-		selectedItemId,
-	]);
+const RECOMMENDATION_TABLE_COLUMNS: Array<{
+	key: keyof ReportRecommendationDetailedRow;
+	label: string;
+	defaultWidth: number;
+	minWidth: number;
+}> = [
+	{
+		key: "status",
+		label: "Status",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.status,
+		minWidth: resolveRecommendationMinWidth("status"),
+	},
+	{
+		key: "recommendationId",
+		label: "Id zalecenia",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.recommendationId,
+		minWidth: resolveRecommendationMinWidth("recommendationId"),
+	},
+	{
+		key: "inspectionId",
+		label: "Id inspekcji",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.inspectionId,
+		minWidth: resolveRecommendationMinWidth("inspectionId"),
+	},
+	{
+		key: "nazwaPodmiotu",
+		label: "Nazwa podmiotu",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.nazwaPodmiotu,
+		minWidth: resolveRecommendationMinWidth("nazwaPodmiotu"),
+	},
+	{
+		key: "zespol",
+		label: "Zespoły",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.zespol,
+		minWidth: resolveRecommendationMinWidth("zespol"),
+	},
+	{
+		key: "dataZalecen",
+		label: "Data zaleceń",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.dataZalecen,
+		minWidth: resolveRecommendationMinWidth("dataZalecen"),
+	},
 
-	const switchPanelMode = (mode: PanelMode) => {
-		if (isRegistryOnlyUser && mode === "management") {
-			return;
-		}
+	{
+		key: "terminWykonaniaZalecen",
+		label: "Termin wykonania zaleceń",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.terminWykonaniaZalecen,
+		minWidth: resolveRecommendationMinWidth("terminWykonaniaZalecen"),
+	},
+	{
+		key: "liczbaZalecen",
+		label: "Liczba zaleceń",
+		defaultWidth: RECOMMENDATION_DEFAULT_COLUMN_WIDTHS.liczbaZalecen,
+		minWidth: resolveRecommendationMinWidth("liczbaZalecen"),
+	},
+];
 
-		setPanelMode(mode);
-		const visibleSections = getVisibleMenuSections(
-			mode,
-			authRole,
-			authRoleId,
-			canViewTimeReports,
-			canViewOwnTimeReport,
-			effectivePermissions,
-		);
-		const nextDefaultItemId =
-			visibleSections[0]?.items[0]?.id ?? getDefaultMenuItemId(mode);
-		setSelectedItemId(nextDefaultItemId);
-	};
+const INITIAL_RECOMMENDATION_COLUMN_WIDTHS: Record<
+	keyof ReportRecommendationDetailedRow,
+	number
+> = RECOMMENDATION_TABLE_COLUMNS.reduce(
+	(accumulator, column) => ({
+		...accumulator,
+		[column.key]: column.defaultWidth,
+	}),
+	{} as Record<keyof ReportRecommendationDetailedRow, number>,
+);
 
-	const handleMenuItemSelect = (itemId: string) => {
-		setSelectedItemId(itemId);
-		setIsSidebarOpen(false);
-	};
+export function WelcomeStartPanel({ operatorLogin }: WelcomeStartPanelProps) {
+	const [activeTopSection, setActiveTopSection] = useState<"inspections" | "recommendations">(
+		getStoredDashboardActiveSection,
+	);
+	const [rows, setRows] = useState<ReportInspectionDetailedRow[]>([]);
+	const [isLoading, setIsLoading] = useState(true);
+	const [error, setError] = useState<string | null>(null);
+	const [stageSummary, setStageSummary] =
+		useState<ReportsInspectionsStageSummaryResponse | null>(null);
+	const [isStageSummaryLoading, setIsStageSummaryLoading] = useState(true);
+	const [stageSummaryError, setStageSummaryError] = useState<string | null>(null);
+	const [selectedStageFilters, setSelectedStageFilters] = useState<StageFilter[]>(
+		getStoredInspectionStageFilters,
+	);
+	const [isInspectionSummaryCollapsed, setIsInspectionSummaryCollapsed] = useState(
+		getStoredInspectionSummaryCollapsed,
+	);
+	const [columnWidths, setColumnWidths] = useState(INITIAL_COLUMN_WIDTHS);
+	const [recommendationRows, setRecommendationRows] = useState<ReportRecommendationDetailedRow[]>(
+		[],
+	);
+	const [isRecommendationsLoading, setIsRecommendationsLoading] = useState(true);
+	const [recommendationsError, setRecommendationsError] = useState<string | null>(null);
+	const [recommendationSummary, setRecommendationSummary] =
+		useState<ReportsRecommendationsStageSummaryResponse | null>(null);
+	const [isRecommendationSummaryLoading, setIsRecommendationSummaryLoading] = useState(true);
+	const [recommendationSummaryError, setRecommendationSummaryError] = useState<string | null>(
+		null,
+	);
+	const [isRecommendationSummaryCollapsed, setIsRecommendationSummaryCollapsed] =
+		useState(getStoredRecommendationSummaryCollapsed);
+	const [selectedRecommendationStatuses, setSelectedRecommendationStatuses] = useState<
+		RecommendationStatusFilter[]
+	>(getStoredRecommendationStatusFilters);
+	const [recommendationColumnWidths, setRecommendationColumnWidths] = useState(
+		INITIAL_RECOMMENDATION_COLUMN_WIDTHS,
+	);
+	const [hoveredStageSliceIndex, setHoveredStageSliceIndex] = useState<number | null>(
+		null,
+	);
+	const [hoveredRecommendationSliceIndex, setHoveredRecommendationSliceIndex] = useState<
+		number | null
+	>(null);
+	const [inspectionStatusStyleByCode, setInspectionStatusStyleByCode] = useState<
+		Record<string, InspectionStatusStyle>
+	>({});
+	const [recommendationStatusStyleByCode, setRecommendationStatusStyleByCode] = useState<
+		Record<string, InspectionStatusStyle>
+	>({});
+	const [inspectionAlertTooltip, setInspectionAlertTooltip] =
+		useState<DashboardTooltipState | null>(null);
 
-	useEffect(() => {
-		if (typeof window === "undefined") {
-			return;
-		}
-
-		const handleOpenInspectionFromDashboard = () => {
-			setPanelMode("registry");
-			setSelectedItemId("inspections");
-			setIsSidebarOpen(false);
-		};
-
-		window.addEventListener(
-			DASHBOARD_OPEN_INSPECTION_EVENT,
-			handleOpenInspectionFromDashboard,
-		);
-
-		const handleOpenRecommendationFromDashboard = () => {
-			setPanelMode("registry");
-			setSelectedItemId("recommendations");
-			setIsSidebarOpen(false);
-		};
-
-		window.addEventListener(
-			DASHBOARD_OPEN_RECOMMENDATION_EVENT,
-			handleOpenRecommendationFromDashboard,
-		);
-
-		const handleOpenSanctionRequestFromDashboard = () => {
-			setPanelMode("registry");
-			setSelectedItemId("sanction_requests");
-			setIsSidebarOpen(false);
-		};
-
-		window.addEventListener(
-			DASHBOARD_OPEN_SANCTION_REQUEST_EVENT,
-			handleOpenSanctionRequestFromDashboard,
-		);
-
-		const handleOpenBindingDecisionFromDashboard = () => {
-			setPanelMode("registry");
-			setSelectedItemId("binding_decisions");
-			setIsSidebarOpen(false);
-		};
-
-		window.addEventListener(
-			DASHBOARD_OPEN_BINDING_DECISION_EVENT,
-			handleOpenBindingDecisionFromDashboard,
-		);
-
-		return () => {
-			window.removeEventListener(
-				DASHBOARD_OPEN_INSPECTION_EVENT,
-				handleOpenInspectionFromDashboard,
-			);
-			window.removeEventListener(
-				DASHBOARD_OPEN_RECOMMENDATION_EVENT,
-				handleOpenRecommendationFromDashboard,
-			);
-			window.removeEventListener(
-				DASHBOARD_OPEN_SANCTION_REQUEST_EVENT,
-				handleOpenSanctionRequestFromDashboard,
-			);
-			window.removeEventListener(
-				DASHBOARD_OPEN_BINDING_DECISION_EVENT,
-				handleOpenBindingDecisionFromDashboard,
-			);
-		};
+	const authRole = useMemo(() => {
+		const storedRole = getStoredAuthSession()?.user?.rola;
+		return normalizeAuthRole(storedRole);
 	}, []);
 
-	const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
-		event.preventDefault();
-
-		const trimmedLogin = loginInput.trim();
-		if (!trimmedLogin || !passwordInput) {
-			setLoginError("Login i hasło są wymagane.");
-			return;
-		}
-
-		setIsLoginSubmitting(true);
-		setLoginError(null);
-
-		try {
-			const response = await fetch("/api/auth/password-login", {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					login: trimmedLogin,
-					password: passwordInput,
-				}),
-			});
-			const errorDetail = !response.ok
-				? await readPasswordLoginErrorDetail(response)
-				: null;
-
-			if (response.status === 400) {
-				setLoginError(errorDetail?.message || "Login i hasło są wymagane.");
-				return;
-			}
-
-			if (response.status === 401) {
-				if (errorDetail?.code === "AUTH_INVALID_CREDENTIALS") {
-					setLoginError(buildInvalidCredentialsMessage(errorDetail));
-					return;
-				}
-
-				setLoginError(errorDetail?.message || "Nieprawidłowy login lub hasło.");
-				return;
-			}
-
-			if (response.status === 403) {
-				setLoginError(errorDetail?.message || "Użytkownik jest nieaktywny.");
-				return;
-			}
-
-			if (response.status === 429) {
-				if (errorDetail?.code === "AUTH_LOGIN_LOCKED") {
-					setLoginError(buildLoginLockedMessage(errorDetail));
-					return;
-				}
-
-				setLoginError(
-					errorDetail?.message ||
-						"Zbyt wiele nieudanych prób logowania. Spróbuj ponownie później.",
-				);
-				return;
-			}
-
-			if (!response.ok) {
-				setLoginError("Nie udało się zalogować. Spróbuj ponownie za chwilę.");
-				return;
-			}
-
-			const payload = (await response.json()) as PasswordLoginResponse;
-			if (!payload.token || !payload.expiresAt || !payload.user) {
-				setLoginError("Nieprawidłowa odpowiedź serwera logowania.");
-				return;
-			}
-
-			// Always reset local UI preferences when establishing a new login session.
-			clearStoredUiPreferences();
-
-			setStoredAuthSession({
-				token: payload.token,
-				expiresAt: payload.expiresAt,
-				user: payload.user,
-			});
-			setLoginError(null);
-			router.replace("/");
-		} catch {
-			setLoginError("Brak połączenia z backendem logowania.");
-		} finally {
-			setIsLoginSubmitting(false);
-		}
-	};
-
-	const clearStoredUiPreferences = () => {
+	useEffect(() => {
 		if (typeof window === "undefined") {
 			return;
 		}
 
-		const uiPrefix = "triangle.ui.";
-		const clearByPrefix = (storage: Storage) => {
-			const keysToRemove: string[] = [];
-			for (let index = 0; index < storage.length; index += 1) {
-				const key = storage.key(index);
-				if (!key || !key.startsWith(uiPrefix)) {
+		window.sessionStorage.setItem(DASHBOARD_ACTIVE_TOP_SECTION_KEY, activeTopSection);
+	}, [activeTopSection]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		window.sessionStorage.setItem(
+			DASHBOARD_SELECTED_INSPECTION_STAGE_FILTERS_KEY,
+			JSON.stringify(selectedStageFilters),
+		);
+	}, [selectedStageFilters]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		window.sessionStorage.setItem(
+			DASHBOARD_INSPECTION_SUMMARY_COLLAPSED_KEY,
+			isInspectionSummaryCollapsed ? "1" : "0",
+		);
+	}, [isInspectionSummaryCollapsed]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		window.sessionStorage.setItem(
+			DASHBOARD_SELECTED_RECOMMENDATION_STATUSES_KEY,
+			JSON.stringify(selectedRecommendationStatuses),
+		);
+	}, [selectedRecommendationStatuses]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		window.sessionStorage.setItem(
+			DASHBOARD_RECOMMENDATION_SUMMARY_COLLAPSED_KEY,
+			isRecommendationSummaryCollapsed ? "1" : "0",
+		);
+	}, [isRecommendationSummaryCollapsed]);
+
+	const loadInspections = useCallback(async () => {
+		setIsLoading(true);
+		setIsStageSummaryLoading(true);
+		setError(null);
+		setStageSummaryError(null);
+
+		const [detailedResult, summaryResult] = await Promise.all([
+			fetchInspectionsDetailedReport(operatorLogin),
+			fetchInspectionsStageSummary(operatorLogin),
+		]);
+
+		if (!detailedResult.ok) {
+			setRows([]);
+			setError(detailedResult.error);
+		} else {
+			setRows(detailedResult.data.rows);
+		}
+
+		if (!summaryResult.ok) {
+			setStageSummary(null);
+			setStageSummaryError(summaryResult.error);
+		} else {
+			setStageSummary(summaryResult.data);
+		}
+
+		setIsLoading(false);
+		setIsStageSummaryLoading(false);
+	}, [operatorLogin]);
+
+	const loadRecommendations = useCallback(async () => {
+		setIsRecommendationsLoading(true);
+		setIsRecommendationSummaryLoading(true);
+		setRecommendationsError(null);
+		setRecommendationSummaryError(null);
+
+		const [detailedResult, summaryResult] = await Promise.all([
+			fetchRecommendationsDetailedReport(operatorLogin),
+			fetchRecommendationsStageSummary(operatorLogin),
+		]);
+
+		if (!detailedResult.ok) {
+			setRecommendationRows([]);
+			setRecommendationsError(detailedResult.error);
+		} else {
+			setRecommendationRows(detailedResult.data.rows);
+		}
+
+		if (!summaryResult.ok) {
+			setRecommendationSummary(null);
+			setRecommendationSummaryError(summaryResult.error);
+		} else {
+			setRecommendationSummary(summaryResult.data);
+		}
+
+		setIsRecommendationsLoading(false);
+		setIsRecommendationSummaryLoading(false);
+	}, [operatorLogin]);
+
+	useEffect(() => {
+		void loadInspections();
+	}, [loadInspections]);
+
+	useEffect(() => {
+		void loadRecommendations();
+	}, [loadRecommendations]);
+
+	useEffect(() => {
+		let isMounted = true;
+
+		const loadInspectionStatusStyles = async () => {
+			const result = await fetchDictionaryEntries("statusy_inspekcji", operatorLogin);
+			if (!isMounted) {
+				return;
+			}
+
+			if (!result.ok) {
+				setInspectionStatusStyleByCode({});
+				return;
+			}
+
+			const nextStyleByCode: Record<string, InspectionStatusStyle> = {};
+			const addStatusStyle = (rawKey: string | null | undefined, style: InspectionStatusStyle) => {
+				const normalizedKey = normalizeStatusLookupKey(rawKey);
+				if (!normalizedKey) {
+					return;
+				}
+
+				nextStyleByCode[normalizedKey] = style;
+			};
+
+			for (const entry of result.data) {
+				const style: InspectionStatusStyle = {
+					kolor: entry.kolor ?? null,
+					odcien: entry.odcien ?? null,
+					intensywnosc: entry.intensywnosc ?? null,
+				};
+
+				addStatusStyle(entry.kodPozycji, style);
+				addStatusStyle(entry.skrotPozycji, style);
+				addStatusStyle(entry.nazwaPozycji, style);
+				addStatusStyle(entry.nazwaUzytkowa, style);
+			}
+
+			setInspectionStatusStyleByCode(nextStyleByCode);
+		};
+
+		void loadInspectionStatusStyles();
+
+		return () => {
+			isMounted = false;
+		};
+	}, [operatorLogin]);
+
+	useEffect(() => {
+		let isMounted = true;
+
+		const loadRecommendationStatusStyles = async () => {
+			const result = await fetchDictionaryEntries("statusy_zalecen", operatorLogin);
+			if (!isMounted) {
+				return;
+			}
+
+			if (!result.ok) {
+				setRecommendationStatusStyleByCode({});
+				return;
+			}
+
+			const nextStyleByCode: Record<string, InspectionStatusStyle> = {};
+			const addStatusStyle = (
+				rawKey: string | null | undefined,
+				style: InspectionStatusStyle,
+			) => {
+				const normalizedKey = normalizeStatusLookupKey(rawKey);
+				if (!normalizedKey) {
+					return;
+				}
+
+				nextStyleByCode[normalizedKey] = style;
+			};
+
+			for (const entry of result.data) {
+				const style: InspectionStatusStyle = {
+					kolor: entry.kolor ?? null,
+					odcien: entry.odcien ?? null,
+					intensywnosc: entry.intensywnosc ?? null,
+				};
+
+				addStatusStyle(entry.kodPozycji, style);
+				addStatusStyle(entry.skrotPozycji, style);
+				addStatusStyle(entry.nazwaPozycji, style);
+				addStatusStyle(entry.nazwaUzytkowa, style);
+			}
+
+			setRecommendationStatusStyleByCode(nextStyleByCode);
+		};
+
+		void loadRecommendationStatusStyles();
+
+		return () => {
+			isMounted = false;
+		};
+	}, [operatorLogin]);
+
+	useEffect(() => {
+		if (isLoading || rows.length === 0) {
+			return;
+		}
+
+		const leaderCurrentCount = rows.filter((row) => row.isLeaderCurrentUser).length;
+		const leaderInManagerTeamCount = rows.filter(
+			(row) => row.isLeaderInManagerTeam,
+		).length;
+		const memberCurrentCount = rows.filter((row) => row.isMemberCurrentUser).length;
+		const memberInManagerTeamCount = rows.filter(
+			(row) => row.isMemberInManagerTeam,
+		).length;
+
+		if (ENABLE_DASHBOARD_DEBUG_LOGS) {
+			console.groupCollapsed("[Dashboard][inspections-detailed] flags summary");
+			console.info("role", authRole);
+			console.info("rows", rows.length);
+			console.info("isLeaderCurrentUser", leaderCurrentCount);
+			console.info("isLeaderInManagerTeam", leaderInManagerTeamCount);
+			console.info("isMemberCurrentUser", memberCurrentCount);
+			console.info("isMemberInManagerTeam", memberInManagerTeamCount);
+			console.table(
+				rows.slice(0, 15).map((row) => ({
+					kodInspekcji: row.kodInspekcji,
+					status: row.statusInspekcji,
+					inspektorKierujacy: row.inspektorKierujacy,
+					isLeaderCurrentUser: row.isLeaderCurrentUser,
+					isLeaderInManagerTeam: row.isLeaderInManagerTeam,
+					isMemberCurrentUser: row.isMemberCurrentUser,
+					isMemberInManagerTeam: row.isMemberInManagerTeam,
+				})),
+			);
+			console.groupEnd();
+		}
+	}, [authRole, isLoading, rows]);
+
+	const orderedStageStatuses = useMemo(
+		() => {
+			const customOrderIndexByCode = new Map<string, number>();
+			for (const [index, code] of INSPECTION_STAGE_ORDER_BY_CODE.entries()) {
+				const normalizedCode = String(code ?? "").trim().toLowerCase();
+				if (!normalizedCode || customOrderIndexByCode.has(normalizedCode)) {
 					continue;
 				}
 
-				keysToRemove.push(key);
+				customOrderIndexByCode.set(normalizedCode, index);
 			}
 
-			for (const key of keysToRemove) {
-				storage.removeItem(key);
-			}
-		};
+			return (stageSummary?.statuses ?? [])
+				.slice()
+				.sort((left, right) => {
+					const leftCode = String(left.stageGroupCode ?? "").trim().toLowerCase();
+					const rightCode = String(right.stageGroupCode ?? "").trim().toLowerCase();
+					const leftCustomRank = customOrderIndexByCode.get(leftCode);
+					const rightCustomRank = customOrderIndexByCode.get(rightCode);
 
-		clearByPrefix(window.localStorage);
-		clearByPrefix(window.sessionStorage);
-	};
-
-	const handleLogout = async () => {
-		const token = getStoredAuthToken();
-		if (token) {
-			try {
-				await fetch("/api/auth/logout-token", {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						Authorization: `Bearer ${token}`,
-					},
-				});
-			} catch {
-				// Local logout still needs to happen even if backend is unreachable.
-			}
-		}
-
-		clearStoredAuthSession();
-		clearStoredUiPreferences();
-		setAuthUser(null);
-		setLoginError(null);
-		setLoginInput("");
-		setPasswordInput("");
-		router.replace("/login");
-	};
-
-	const inactivityTimeout = useInactivityTimeout({
-		enabled: Boolean(authUser) && !isCheckingSession,
-		inactivityMs: GLOBAL_INACTIVITY_TIMEOUT_MS,
-		warningMs: GLOBAL_INACTIVITY_WARNING_MS,
-		onTimeout: () => {
-			void handleLogout();
-		},
-	});
-
-	if (isCheckingSession && !authUser) {
-		return (
-			<div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#09152b] px-4 text-slate-100">
-				<p className="text-slate-200/80">Sprawdzanie sesji...</p>
-			</div>
-		);
-	}
-
-	if (!authUser && pathname !== "/login") {
-		return (
-			<div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#09152b] px-4 text-slate-100">
-				<p className="text-slate-200/80">Przekierowywanie do logowania...</p>
-			</div>
-		);
-	}
-
-	if (!authUser) {
-		return (
-			<div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#09152b] px-4 text-slate-100">
-				<div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_20%,rgba(103,163,255,0.22),transparent_34%),radial-gradient(circle_at_82%_82%,rgba(56,189,248,0.16),transparent_34%),linear-gradient(180deg,#09152b_0%,#071028_100%)]" />
-
-				<div className="relative z-10 w-full max-w-md rounded-2xl border border-[#37547e] bg-linear-to-b from-[#1d3154]/96 via-[#182a4a]/96 to-[#132341]/96 p-6 shadow-[0_24px_64px_rgba(2,8,23,0.52)]">
-					<div className="mb-6">
-						<div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#4c78b1] bg-[#284878] text-sky-100">
-							<ShieldCheck size={20} />
-						</div>
-
-						<p className="font-semibold text-[11px] text-slate-300/85 uppercase tracking-[0.16em]">
-							System
-						</p>
-						<h1 className="mt-1 font-bold text-4xl text-sky-300 leading-none">
-							Rejestr spraw
-						</h1>
-						<p className="mt-2 text-slate-200/80 text-sm">
-							Uniwersytet Jazdy Rowerem
-						</p>
-						<p className="mt-1 text-slate-200/80 text-sm">
-							Zaloguj się, aby kontynuować pracę w aplikacji.
-						</p>
-					</div>
-
-					<form className="space-y-3" onSubmit={handleLogin}>
-						<label className="block text-slate-200 text-sm">
-							<span className="mb-1.5 block font-medium">Login</span>
-							<input
-								type="text"
-								value={loginInput}
-								onChange={(event) => setLoginInput(event.target.value)}
-								placeholder="np. user123"
-								className="w-full rounded-xl border border-[#4a6a98] bg-[#12213d] px-3 py-2.5 text-slate-100 outline-none transition-colors placeholder:text-slate-400 focus:border-sky-300"
-							/>
-						</label>
-
-						<label className="block text-slate-200 text-sm">
-							<span className="mb-1.5 block font-medium">Hasło</span>
-							<input
-								type="password"
-								value={passwordInput}
-								onChange={(event) => setPasswordInput(event.target.value)}
-								placeholder="Wpisz hasło"
-								className="w-full rounded-xl border border-[#4a6a98] bg-[#12213d] px-3 py-2.5 text-slate-100 outline-none transition-colors placeholder:text-slate-400 focus:border-sky-300"
-							/>
-						</label>
-
-						{loginError ? (
-							<p className="whitespace-pre-line font-medium text-rose-300 text-sm">{loginError}</p>
-						) : null}
-
-						<button
-							type="submit"
-							disabled={isLoginSubmitting}
-							className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#6ea3f0] bg-linear-to-r from-[#2f4f83] to-[#365e9a] font-semibold text-base text-white transition-colors hover:from-[#3a619e] hover:to-[#4673b4] disabled:cursor-not-allowed disabled:opacity-70"
-						>
-							{isLoginSubmitting ? "Logowanie..." : "Zaloguj"}
-						</button>
-
-						<button
-							type="button"
-							onClick={() => router.push("/forgot-password")}
-							className="inline-flex h-9 w-full items-center justify-center rounded-lg border border-[#5b7fae] bg-[#203a62] px-3 font-semibold text-sm text-slate-100 transition-colors hover:bg-[#2a4a79]"
-						>
-							Nie pamiętam hasła
-						</button>
-					</form>
-
-					<p className="mt-5 border-[#33517d] border-t pt-3 text-center text-slate-300/85 text-xs">
-						Rejestr spraw | Wersja robocza
-					</p>
-				</div>
-			</div>
-		);
-	}
-
-	const sidebarContent = (
-		<>
-			<div className="mb-4 hidden lg:block">
-				<div className="relative min-w-0 rounded-2xl border border-[#3f5f8f] bg-[#22385c]/85 py-3.5 pr-3.5 pl-16 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
-					<button
-						type="button"
-						onClick={() => setIsDesktopSidebarExpanded(false)}
-						aria-label="Ukryj menu"
-						className="absolute top-1/2 left-3 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-xl border border-slate-700 bg-[#1b2c4a] text-slate-100 transition-colors hover:bg-[#24395f]"
-					>
-						<Menu size={16} />
-					</button>
-
-					<p className="text-[11px] text-slate-300/80 uppercase tracking-[0.14em]">
-						Rejestr spraw
-					</p>
-					<h1 className="mt-1 font-bold text-[1.75rem] text-sky-300 leading-none">
-						{companyShortName}
-					</h1>
-				</div>
-			</div>
-
-			{!isRegistryOnlyUser ? (
-				<div className="mb-5 grid grid-cols-2 gap-2 rounded-xl border border-[#37537d] bg-[#1c3153]/80 p-1.5">
-					<button
-						type="button"
-						onClick={() => switchPanelMode("registry")}
-						className={`rounded-lg px-3 py-2 font-semibold text-sm transition-colors ${
-							panelMode === "registry"
-								? "bg-[#345689] text-white"
-								: "text-slate-200 hover:bg-[#274470]"
-						}`}
-					>
-						Rejestr
-					</button>
-
-					<button
-						type="button"
-						onClick={() => switchPanelMode("management")}
-						className={`rounded-lg px-3 py-2 font-semibold text-sm transition-colors ${
-							panelMode === "management"
-								? "bg-[#345689] text-white"
-								: "text-slate-200 hover:bg-[#274470]"
-						}`}
-					>
-						Zarządzanie
-					</button>
-				</div>
-			) : null}
-
-			<nav className="sidebar-menu-scroll min-h-0 flex-1 space-y-4 overflow-y-auto">
-				{menuSections.map((section) => {
-					const SectionIcon = getSectionIcon(section);
-					const isStartSection = section.id === "start";
-					const isStartActive = selectedItemId === "start";
-
-					return (
-						<section key={section.id} className="px-1 pb-2">
-							{isStartSection ? (
-								<button
-									type="button"
-									onClick={() => handleMenuItemSelect("start")}
-									className={`mb-2 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left font-semibold text-[1rem] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 ${
-										isStartActive
-											? "bg-[#345689]/90 text-white"
-											: "text-slate-100 hover:bg-[#22375b]/65"
-									}`}
-								>
-									<SectionIcon size={16} className="text-slate-300" />
-									{section.label}
-								</button>
-							) : (
-								<div className="mb-2 flex w-full items-center rounded-md px-1 py-1 text-left font-semibold text-[1rem] text-slate-100">
-									<span className="flex items-center gap-2">
-										<SectionIcon size={16} className="text-slate-300" />
-										{section.label}
-									</span>
-								</div>
-							)}
-
-							{isStartSection ? null : (
-								<div className="space-y-0.5">
-								{section.items.map((item) => {
-									const isActive = item.id === selectedItemId;
-
-									return (
-										<button
-											key={item.id}
-											type="button"
-											onClick={() => handleMenuItemSelect(item.id)}
-											className={`group relative flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[1rem] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 ${
-												isActive
-													? "bg-[#345689]/90 text-white"
-													: "text-slate-100/90 hover:bg-[#22375b]/65"
-											}`}
-										>
-											{isActive ? (
-												<span className="absolute inset-y-1 left-0 w-0.5 rounded-r bg-sky-300" />
-											) : null}
-											<span
-												className={`h-1.5 w-1.5 rounded-full ${isActive ? "bg-sky-300" : "bg-slate-500"}`}
-											/>
-											{item.label}
-										</button>
-									);
-								})}
-								</div>
-							)}
-
-							<div className="mt-3 border-[#36517b]/60 border-b" />
-						</section>
-					);
-				})}
-			</nav>
-
-			<div className="mt-4 rounded-xl border border-[#466792] bg-[#1f3558]/90 p-3">
-				<p className="text-[11px] text-slate-300/80 uppercase tracking-[0.12em]">
-					Konto
-				</p>
-				<p className="mt-1 truncate font-semibold text-slate-100 text-sm">
-					{authUser.login}
-				</p>
-
-				<div className="mt-3 flex items-center gap-2">
-					<button
-						type="button"
-						onClick={() => router.push("/change-password")}
-						className="inline-flex h-8 items-center justify-center rounded-md border border-[#5b7fae] bg-[#2a4774] px-2.5 font-semibold text-slate-100 text-xs transition-colors hover:bg-[#35598e]"
-					>
-						Zmień hasło
-					</button>
-
-					<button
-						type="button"
-						onClick={() => void handleLogout()}
-						className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#5b7fae] bg-[#2a4774] px-2.5 font-semibold text-slate-100 text-xs transition-colors hover:bg-[#35598e]"
-					>
-						<LogOut size={14} />
-						Wyloguj
-					</button>
-				</div>
-			</div>
-		</>
-	);
-
-	const compactSidebarContent = (
-		<>
-			<button
-				type="button"
-				onClick={() => setIsDesktopSidebarExpanded(true)}
-				aria-label="Pokaz menu"
-				className="mb-4 w-full rounded-2xl border border-[#3f5f8f] bg-[#22385c]/85 p-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition-colors hover:bg-[#2a4369]/35"
-			>
-				<span className="flex items-center justify-center gap-1.5">
-					<span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-transparent text-slate-100">
-						<Menu size={14} />
-					</span>
-
-					<span className="flex h-8 w-8 items-center justify-center rounded-lg bg-transparent font-bold text-sky-300 text-xs">
-						{companyShortName}
-					</span>
-				</span>
-			</button>
-
-			<nav className="sidebar-menu-scroll min-h-0 flex-1 space-y-3 overflow-y-auto">
-				{(panelMode === "registry"
-					? menuSections.filter(
-							(section) =>
-								section.id === "start" ||
-								section.id === "registers" ||
-								section.id === "tools" ||
-								section.id === "dictionaries",
-						)
-					: menuSections
-				).map((section, sectionIndex, sections) => {
-					const SectionIcon = getSectionIcon(section);
-					const targetItemId = section.items[0]?.id;
-					const isSectionActive = section.items.some(
-						(item) => item.id === selectedItemId,
-					);
-					const isRegistersSection =
-						panelMode === "registry" && section.id === "registers";
-					const isReportsSection =
-						panelMode === "registry" && section.id === "tools";
-					const isManagementSection =
-						panelMode === "management" && section.id === "management";
-					const isShortcutSection =
-						isRegistersSection || isReportsSection || isManagementSection;
-					const registerShortcuts = [
-						{ id: "inspections", shortLabel: "I" },
-						{ id: "recommendations", shortLabel: "Z" },
-						{ id: "binding_decisions", shortLabel: "DZ" },
-						{ id: "sanction_requests", shortLabel: "WS" },
-					].filter((shortcut) =>
-						section.items.some((item) => item.id === shortcut.id),
-					);
-					const reportShortcuts = [
-						{ id: "reports", shortLabel: "WI" },
-						{ id: "report_protocol_time", shortLabel: "CP" },
-						{ id: "report_statement_time", shortLabel: "CS" },
-					].filter((shortcut) =>
-						section.items.some((item) => item.id === shortcut.id),
-					);
-					const managementShortcuts = [
-						{ id: "dictionaries", shortLabel: "S" },
-						{ id: "teams", shortLabel: "Z" },
-						{ id: "users", shortLabel: "U" },
-						{ id: "schedules", shortLabel: "H" },
-						{ id: "logs", shortLabel: "L" },
-					].filter((shortcut) =>
-						section.items.some((item) => item.id === shortcut.id),
-					);
-					const sectionShortcuts = isRegistersSection
-						? registerShortcuts
-						: isReportsSection
-							? reportShortcuts
-							: isManagementSection
-								? managementShortcuts
-								: [];
-
-					if (!targetItemId) {
-						return null;
+					if (leftCustomRank !== undefined && rightCustomRank !== undefined) {
+						if (leftCustomRank !== rightCustomRank) {
+							return leftCustomRank - rightCustomRank;
+						}
 					}
 
-					return (
-						<div
-							key={section.id}
-							className="flex w-full flex-col items-center gap-2"
-						>
-							<button
-								type="button"
-								title={section.label}
-								onClick={() => setSelectedItemId(targetItemId)}
-								className={`relative inline-flex h-10 w-10 items-center justify-center rounded-xl border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 ${
-									isSectionActive
-										? "border-[#84b0f2] bg-[#345689] text-sky-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]"
-										: "border-transparent text-slate-200/90 hover:border-[#43628f] hover:bg-[#22375b]"
-								}`}
-								aria-label={section.label}
-							>
-								<SectionIcon size={18} />
-							</button>
+					if (leftCustomRank !== undefined) {
+						return -1;
+					}
 
-							{isShortcutSection ? (
-								<div className="flex flex-col items-center gap-1.5">
-									{sectionShortcuts.map((shortcut) => {
-										const isShortcutActive = selectedItemId === shortcut.id;
-										const shortcutLabel =
-											section.items.find((item) => item.id === shortcut.id)?.label ??
-											shortcut.shortLabel;
+					if (rightCustomRank !== undefined) {
+						return 1;
+					}
 
-										return (
-											<button
-												key={shortcut.id}
-												type="button"
-												title={shortcutLabel}
-												onClick={() => setSelectedItemId(shortcut.id)}
-												className={`inline-flex h-7 min-w-7 items-center justify-center rounded-full border px-1.5 font-bold text-[10px] leading-none transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/60 ${
-													isShortcutActive
-														? "border-[#84b0f2] bg-[#345689] text-white"
-														: "border-[#3f5f8f] bg-[#22385c]/70 text-slate-200 hover:bg-[#2b4872]"
-												}`}
-												aria-label={shortcutLabel}
-											>
-												{shortcut.shortLabel}
-											</button>
-										);
-									})}
-								</div>
-							) : null}
+					return left.stageGroupOrder - right.stageGroupOrder;
+				})
+				.map((status) => ({
+					stageCode: status.stageGroupCode,
+					stageLabel: normalizePolishLabel(status.stageGroupLabel),
+					count: status.count,
+				}))
+				.filter(
+					(status) =>
+						status.stageLabel.trim().length > 0 &&
+						!shouldHideInspectionStageStatus(status.stageLabel),
+				);
+		},
+		[stageSummary],
+	);
 
-							{sectionIndex < sections.length - 1 ? (
-								<div className="mt-1 w-full border-[#36517b]/60 border-b" />
-							) : null}
-						</div>
-					);
-				})}
-			</nav>
+	const stageOverviewData = useMemo<StageOverviewSlice[]>(
+		() =>
+			orderedStageStatuses.map((status) => ({
+				stageGroupCode: status.stageCode,
+				stageGroupLabel: status.stageLabel,
+				count: status.count,
+			})),
+		[orderedStageStatuses],
+	);
 
-			<div className="mt-4 flex flex-col items-center gap-2 rounded-xl border border-[#466792] bg-[#1f3558]/90 p-2">
-				<button
-					type="button"
-					onClick={() => router.push("/change-password")}
-					title="Zmien haslo"
-					className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#5b7fae] bg-[#2a4774] text-slate-100 transition-colors hover:bg-[#35598e]"
-					aria-label="Zmien haslo"
-				>
-					<KeyRound size={16} />
-				</button>
+	const stageOverviewTotal = useMemo(
+		() => stageOverviewData.reduce((sum, slice) => sum + slice.count, 0),
+		[stageOverviewData],
+	);
 
-				<button
-					type="button"
-					onClick={() => void handleLogout()}
-					title="Wyloguj"
-					className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#5b7fae] bg-[#2a4774] text-slate-100 transition-colors hover:bg-[#35598e]"
-					aria-label="Wyloguj"
-				>
-					<LogOut size={16} />
-				</button>
-			</div>
-		</>
+	useEffect(() => {
+		if (
+			hoveredStageSliceIndex !== null &&
+			(hoveredStageSliceIndex < 0 || hoveredStageSliceIndex >= stageOverviewData.length)
+		) {
+			setHoveredStageSliceIndex(null);
+		}
+	}, [hoveredStageSliceIndex, stageOverviewData.length]);
+
+	const visibleStageStatuses = useMemo(
+		() =>
+			orderedStageStatuses.map((status) => ({
+				stageCode: status.stageCode,
+				stageLabel: status.stageLabel,
+				count: status.count,
+			})),
+		[orderedStageStatuses],
+	);
+
+	const shouldShowInspectionStatusScroll =
+		visibleStageStatuses.length > INSPECTION_STATUS_SCROLL_THRESHOLD;
+
+	const inspectionStageLabelByCode = useMemo(() => {
+		const map = new Map<string, string>();
+		for (const status of stageSummary?.statuses ?? []) {
+			const code = String(status.stageGroupCode ?? "").trim().toLowerCase();
+			const label = normalizePolishLabel(String(status.stageGroupLabel ?? "").trim());
+			if (!code || !label || label === "-") {
+				continue;
+			}
+			map.set(code, label);
+		}
+		return map;
+	}, [stageSummary]);
+
+	const resolveInspectionStatusLabel = useCallback(
+		(row: ReportInspectionDetailedRow) => {
+			const groupCode = row.stageGroupCode.trim().toLowerCase();
+			const subgroupCode = row.stageSubgroupCode.trim().toLowerCase();
+			const mappedLabel =
+				inspectionStageLabelByCode.get(groupCode) ??
+				inspectionStageLabelByCode.get(subgroupCode);
+
+			if (mappedLabel) {
+				return mappedLabel;
+			}
+
+			return shortenDuplicatedStatusLabel(String(row.statusInspekcji ?? "-"));
+		},
+		[inspectionStageLabelByCode],
+	);
+
+	useEffect(() => {
+		if (visibleStageStatuses.length === 0) {
+			if (selectedStageFilters.length > 0) {
+				setSelectedStageFilters([]);
+			}
+			return;
+		}
+
+		const allowedCodes = new Set(
+			visibleStageStatuses.map((status) => status.stageCode.trim().toLowerCase()),
+		);
+		const nextFilters = selectedStageFilters.filter((filter) =>
+			allowedCodes.has(filter.stageCode.trim().toLowerCase()),
+		);
+
+		if (nextFilters.length !== selectedStageFilters.length) {
+			setSelectedStageFilters(nextFilters);
+		}
+	}, [selectedStageFilters, visibleStageStatuses]);
+
+	const orderedRecommendationGroups = useMemo(
+		() =>
+			(recommendationSummary?.groups ?? [])
+				.slice()
+				.sort((left, right) => left.stageGroupOrder - right.stageGroupOrder)
+				.map((group) => ({
+					...group,
+					stageGroupLabel: normalizePolishLabel(group.stageGroupLabel),
+					stageGroupShortLabel: normalizePolishLabel(group.stageGroupShortLabel),
+				}))
+				.filter(
+					(group) =>
+						!shouldHideRecommendationStatus(group.stageGroupLabel) &&
+						!shouldHideRecommendationStatus(group.stageGroupShortLabel),
+				),
+		[recommendationSummary],
+	);
+
+	const shouldShowRecommendationStatusScroll =
+		orderedRecommendationGroups.length > RECOMMENDATION_STATUS_SCROLL_THRESHOLD;
+
+	useEffect(() => {
+		if (orderedRecommendationGroups.length === 0) {
+			if (selectedRecommendationStatuses.length > 0) {
+				setSelectedRecommendationStatuses([]);
+			}
+			return;
+		}
+
+		const allowedCodes = new Set(
+			orderedRecommendationGroups.map((group) =>
+				group.stageGroupCode.trim().toLowerCase(),
+			),
+		);
+		const nextFilters = selectedRecommendationStatuses.filter((filter) =>
+			allowedCodes.has(filter.stageGroupCode.trim().toLowerCase()),
+		);
+
+		if (nextFilters.length !== selectedRecommendationStatuses.length) {
+			setSelectedRecommendationStatuses(nextFilters);
+		}
+	}, [orderedRecommendationGroups, selectedRecommendationStatuses]);
+
+	const recommendationOverviewData = useMemo<StageOverviewSlice[]>(
+		() =>
+			orderedRecommendationGroups.map((group) => ({
+				stageGroupCode: group.stageGroupCode,
+				stageGroupLabel: group.stageGroupShortLabel || group.stageGroupLabel,
+				count: group.count,
+			})),
+		[orderedRecommendationGroups],
+	);
+
+	const recommendationOverviewTotal = useMemo(
+		() => recommendationOverviewData.reduce((sum, slice) => sum + slice.count, 0),
+		[recommendationOverviewData],
+	);
+
+	useEffect(() => {
+		if (
+			hoveredRecommendationSliceIndex !== null &&
+			(hoveredRecommendationSliceIndex < 0 ||
+				hoveredRecommendationSliceIndex >= recommendationOverviewData.length)
+		) {
+			setHoveredRecommendationSliceIndex(null);
+		}
+	}, [hoveredRecommendationSliceIndex, recommendationOverviewData.length]);
+
+	const visibleRecommendationRows = useMemo(
+		() =>
+			recommendationRows.filter((row) => {
+				const status = String(row.status ?? "");
+				const statusShort = String(row.statusSkrot ?? "");
+				return (
+					!shouldHideRecommendationStatus(status) &&
+					!shouldHideRecommendationStatus(statusShort)
+				);
+			}),
+		[recommendationRows],
+	);
+
+	const filteredRecommendationRows = useMemo(() => {
+		if (selectedRecommendationStatuses.length === 0) {
+			return visibleRecommendationRows;
+		}
+
+		const selectedCodes = new Set(
+			selectedRecommendationStatuses.map((filter) => filter.stageGroupCode.trim().toLowerCase()),
+		);
+		const selectedLabels = new Set(
+			selectedRecommendationStatuses.map((filter) =>
+				filter.stageGroupLabel.trim().toLowerCase(),
+			),
+		);
+		const selectedShortLabels = new Set(
+			selectedRecommendationStatuses
+				.map((filter) => (filter.stageGroupShortLabel ?? "").trim().toLowerCase())
+				.filter(Boolean),
+		);
+
+		return visibleRecommendationRows.filter((row) => {
+			const normalizedStatus = row.status.trim().toLowerCase();
+			const normalizedStatusSkrot = row.statusSkrot.trim().toLowerCase();
+			return (
+				selectedCodes.has(normalizedStatus) ||
+				selectedLabels.has(normalizedStatus) ||
+				selectedShortLabels.has(normalizedStatusSkrot)
+			);
+		});
+	}, [selectedRecommendationStatuses, visibleRecommendationRows]);
+
+	const filteredRows = useMemo(() => {
+		const statusOrder = orderedStageStatuses.map((status) =>
+			normalizePolishLabel(status.stageLabel).trim().toLowerCase(),
+		);
+
+		const findStatusRank = (row: ReportInspectionDetailedRow) => {
+			const normalizedStageLabel = normalizePolishLabel(String(row.statusInspekcji ?? "-"))
+				.trim()
+				.toLowerCase();
+			const normalizedStageLabelShort = shortenDuplicatedStatusLabel(normalizedStageLabel)
+				.trim()
+				.toLowerCase();
+
+			const rank = statusOrder.findIndex((label) => {
+				const shortLabel = shortenDuplicatedStatusLabel(label).trim().toLowerCase();
+				return (
+					label === normalizedStageLabel ||
+					shortLabel === normalizedStageLabelShort ||
+					label.includes(normalizedStageLabelShort) ||
+					normalizedStageLabel.includes(label)
+				);
+			});
+
+			return rank >= 0 ? rank : Number.MAX_SAFE_INTEGER;
+		};
+
+		const sortRowsByStatusOrder = (inputRows: ReportInspectionDetailedRow[]) =>
+			inputRows
+				.map((row, originalIndex) => ({ row, originalIndex }))
+				.sort((left, right) => {
+					const leftRank = findStatusRank(left.row);
+					const rightRank = findStatusRank(right.row);
+					if (leftRank !== rightRank) {
+						return leftRank - rightRank;
+					}
+					return left.originalIndex - right.originalIndex;
+				})
+				.map((entry) => entry.row);
+
+		if (selectedStageFilters.length === 0) {
+			return sortRowsByStatusOrder(rows);
+		}
+
+		const selectedCodes = new Set(
+			selectedStageFilters.map((filter) => filter.stageCode.trim().toLowerCase()),
+		);
+		const selectedLabelsRaw = selectedStageFilters
+			.map((filter) => normalizePolishLabel(filter.stageLabel).trim().toLowerCase())
+			.filter(Boolean);
+		const selectedLabels = new Set(selectedLabelsRaw);
+		const selectedShortLabels = new Set(
+			selectedLabelsRaw
+				.map((label) => shortenDuplicatedStatusLabel(label).trim().toLowerCase())
+				.filter(Boolean),
+		);
+
+		const filtered = rows.filter((row) => {
+			const normalizedGroupCode = row.stageGroupCode.trim().toLowerCase();
+			const normalizedSubgroupCode = row.stageSubgroupCode.trim().toLowerCase();
+			const normalizedStageLabel = normalizePolishLabel(String(row.statusInspekcji ?? "-"))
+				.trim()
+				.toLowerCase();
+			const normalizedStageLabelShort = shortenDuplicatedStatusLabel(normalizedStageLabel)
+				.trim()
+				.toLowerCase();
+
+			const matchesLabel =
+				selectedLabels.has(normalizedStageLabel) ||
+				selectedShortLabels.has(normalizedStageLabelShort) ||
+				selectedLabelsRaw.some(
+					(label) =>
+						label.includes(normalizedStageLabelShort) ||
+						normalizedStageLabel.includes(label),
+				);
+
+			return (
+				selectedCodes.has(normalizedGroupCode) ||
+				selectedCodes.has(normalizedSubgroupCode) ||
+				matchesLabel
+			);
+		});
+
+		return sortRowsByStatusOrder(filtered);
+	}, [orderedStageStatuses, rows, selectedStageFilters]);
+
+	useEffect(() => {
+		if (activeTopSection !== "inspections") {
+			return;
+		}
+
+		const displayedStatusRows = filteredRows.map((row) => ({
+			kodInspekcji: row.kodInspekcji,
+			statusRaw: String(row.statusInspekcji ?? "-"),
+			statusDisplayed: resolveInspectionStatusLabel(row),
+		}));
+
+		if (ENABLE_DASHBOARD_DEBUG_LOGS) {
+			console.groupCollapsed("[Dashboard][inspections-status-column] displayed values");
+			console.table(displayedStatusRows);
+			console.groupEnd();
+		}
+	}, [activeTopSection, filteredRows, resolveInspectionStatusLabel]);
+
+	const startColumnResize = useCallback(
+		(columnKey: keyof ReportInspectionDetailedRow, event: React.MouseEvent) => {
+			event.preventDefault();
+			event.stopPropagation();
+
+			const startX = event.clientX;
+			const startWidth = columnWidths[columnKey] ?? 180;
+			const minWidth = TABLE_COLUMNS.find((column) => column.key === columnKey)?.minWidth ?? 100;
+
+			const handleMouseMove = (mouseEvent: MouseEvent) => {
+				const deltaX = mouseEvent.clientX - startX;
+				setColumnWidths((current) => ({
+					...current,
+					[columnKey]: Math.max(minWidth, startWidth + deltaX),
+				}));
+			};
+
+			const handleMouseUp = () => {
+				window.removeEventListener("mousemove", handleMouseMove);
+				window.removeEventListener("mouseup", handleMouseUp);
+				document.body.style.cursor = "";
+				document.body.style.userSelect = "";
+			};
+
+			document.body.style.cursor = "col-resize";
+			document.body.style.userSelect = "none";
+			window.addEventListener("mousemove", handleMouseMove);
+			window.addEventListener("mouseup", handleMouseUp);
+		},
+		[columnWidths],
+	);
+
+	const startRecommendationColumnResize = useCallback(
+		(columnKey: keyof ReportRecommendationDetailedRow, event: React.MouseEvent) => {
+			event.preventDefault();
+			event.stopPropagation();
+
+			const startX = event.clientX;
+			const startWidth = recommendationColumnWidths[columnKey] ?? 160;
+			const minWidth =
+				RECOMMENDATION_TABLE_COLUMNS.find((column) => column.key === columnKey)?.minWidth ?? 100;
+
+			const handleMouseMove = (mouseEvent: MouseEvent) => {
+				const deltaX = mouseEvent.clientX - startX;
+				setRecommendationColumnWidths((current) => ({
+					...current,
+					[columnKey]: Math.max(minWidth, startWidth + deltaX),
+				}));
+			};
+
+			const handleMouseUp = () => {
+				window.removeEventListener("mousemove", handleMouseMove);
+				window.removeEventListener("mouseup", handleMouseUp);
+				document.body.style.cursor = "";
+				document.body.style.userSelect = "";
+			};
+
+			document.body.style.cursor = "col-resize";
+			document.body.style.userSelect = "none";
+			window.addEventListener("mousemove", handleMouseMove);
+			window.addEventListener("mouseup", handleMouseUp);
+		},
+		[recommendationColumnWidths],
+	);
+
+	const hideInspectionAlertTooltip = useCallback(() => {
+		setInspectionAlertTooltip(null);
+	}, []);
+
+	const showInspectionAlertTooltip = useCallback(
+		(
+			event: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
+			text: string,
+		) => {
+			const rect = event.currentTarget.getBoundingClientRect();
+			const estimatedTooltipWidthPx = 320;
+			const viewportPaddingPx = 12;
+			const viewportWidth = window.innerWidth;
+			const desiredLeft = rect.left + rect.width / 2 - estimatedTooltipWidthPx / 2;
+			const clampedLeft = Math.max(
+				viewportPaddingPx,
+				Math.min(
+					desiredLeft,
+					viewportWidth - estimatedTooltipWidthPx - viewportPaddingPx,
+				),
+			);
+
+			setInspectionAlertTooltip({
+				text,
+				x: clampedLeft,
+				y: Math.max(8, rect.bottom + 8),
+			});
+		},
+		[],
 	);
 
 	return (
-		<div className="relative flex h-dvh min-h-screen w-full overflow-hidden bg-[#09152b] text-slate-100">
-			{inactivityTimeout.isWarning ? (
-				<div className="fixed top-4 right-4 z-50 max-w-sm rounded-xl border border-amber-300/60 bg-amber-100 px-4 py-3 text-amber-900 shadow-xl">
-					<p className="font-semibold text-sm">Automatyczne wylogowanie</p>
-					<p className="mt-1 text-sm">
-						Brak aktywności. Wylogowanie za <span className="tabular-nums">{inactivityTimeout.secondsRemaining}</span> s.
-					</p>
-					<button
-						type="button"
-						onClick={inactivityTimeout.resetTimer}
-						className="mt-3 inline-flex h-8 items-center justify-center rounded-md border border-amber-500/70 bg-amber-200 px-3 font-semibold text-[13px] hover:bg-amber-300"
-					>
-						Kontynuuj pracę
-					</button>
-				</div>
+		<section className="flex h-full min-h-0 w-full flex-col py-2">
+			{error ? (
+				<p className="mb-3 rounded-lg border border-rose-300/50 bg-rose-950/30 px-3 py-2 text-rose-100 text-sm">
+					{error}
+				</p>
 			) : null}
 
-			{isSidebarOpen ? (
+			<div className="mb-3 flex flex-wrap items-end gap-2 border-[#2a4772] border-b">
 				<button
 					type="button"
-					aria-label="Zamknij menu"
-					className="fixed inset-0 z-20 bg-slate-950/50 lg:hidden"
-					onClick={() => setIsSidebarOpen(false)}
-				/>
-			) : null}
-
-			<aside
-				className={`fixed inset-y-0 left-0 z-30 flex h-dvh w-[22rem] flex-col border-[#2f4368] border-r bg-linear-to-b from-[#1d3053] via-[#192b49] to-[#14233e] p-5 shadow-[12px_0_28px_rgba(2,8,23,0.38)] transition-transform duration-300 lg:hidden ${
-					isSidebarOpen ? "translate-x-0" : "-translate-x-full"
-				}`}
-			>
-				{sidebarContent}
-			</aside>
-
-			<div
-				className={`hidden shrink-0 overflow-hidden transition-[width] duration-300 lg:block ${
-					isDesktopSidebarExpanded ? "lg:w-[14.5rem] xl:w-[15rem]" : "lg:w-[4.5rem]"
-				}`}
-			>
-				{isDesktopSidebarExpanded ? (
-					<aside className="flex h-full w-[14.5rem] flex-col border-[#2f4368] border-r bg-linear-to-b from-[#1d3053] via-[#192b49] to-[#14233e] px-3 py-4 shadow-[12px_0_28px_rgba(2,8,23,0.38)] xl:w-[15rem] xl:px-4 xl:py-5">
-						{sidebarContent}
-					</aside>
-				) : (
-					<aside className="flex h-full w-[4.5rem] flex-col border-[#2f4368] border-r bg-linear-to-b from-[#1d3053] via-[#192b49] to-[#14233e] p-2.5 shadow-[12px_0_28px_rgba(2,8,23,0.38)]">
-						{compactSidebarContent}
-					</aside>
-				)}
+					onClick={() => setActiveTopSection("inspections")}
+					className={`-mb-px inline-flex h-9 items-center rounded-t-md border px-3.5 font-semibold text-sm transition-colors ${
+						activeTopSection === "inspections"
+							? "border-[#8fb6ee] border-b-[#101f39] bg-[#f8fbff] text-slate-900"
+							: "border-transparent bg-transparent text-white hover:bg-[#18365a]/35 hover:text-white"
+					}`}
+				>
+					Inspekcje
+				</button>
+				<button
+					type="button"
+					onClick={() => setActiveTopSection("recommendations")}
+					className={`-mb-px inline-flex h-9 items-center rounded-t-md border px-3.5 font-semibold text-sm transition-colors ${
+						activeTopSection === "recommendations"
+							? "border-[#8fb6ee] border-b-[#101f39] bg-[#f8fbff] text-slate-900"
+							: "border-transparent bg-transparent text-white hover:bg-[#18365a]/35 hover:text-white"
+					}`}
+				>
+					Zalecenia
+				</button>
 			</div>
 
-			<main className="min-h-0 min-w-0 flex flex-1 flex-col overflow-hidden p-0 sm:p-0 lg:pt-0 lg:pl-1 lg:pr-0 lg:pb-0 xl:pt-0 xl:pl-1 xl:pr-0 xl:pb-0">
-				<div className="mb-4 flex items-center gap-1 lg:hidden">
+			{activeTopSection === "inspections" ? (
+				<>
+			<div className="mb-1 shrink-0 overflow-hidden rounded-2xl border border-slate-300 bg-white">
+				<div
+					className="flex cursor-pointer items-center justify-between gap-2 border-slate-300 border-b bg-slate-100 px-3 py-2"
+					onClick={() => setIsInspectionSummaryCollapsed((current) => !current)}
+					role="button"
+					tabIndex={0}
+					onKeyDown={(event) => {
+						if (event.key === "Enter" || event.key === " ") {
+							event.preventDefault();
+							setIsInspectionSummaryCollapsed((current) => !current);
+						}
+					}}
+					aria-expanded={!isInspectionSummaryCollapsed}
+					aria-controls="inspection-summary-panel"
+				>
+					<div className="inline-flex items-center gap-2 text-left text-slate-800 text-xs transition-colors hover:text-slate-900">
+						{isInspectionSummaryCollapsed ? (
+							<ChevronRight className="h-4 w-4 shrink-0" />
+						) : (
+							<ChevronDown className="h-4 w-4 shrink-0" />
+						)}
+						<span className="font-semibold text-sm tracking-wide">Podsumowanie inspekcji</span>
+					</div>
+
 					<button
 						type="button"
-						onClick={() => setIsSidebarOpen(true)}
-						className="inline-flex items-center gap-2 rounded-md border border-slate-700 bg-[#1b2c4a] px-3 py-2 text-sm"
+						onClick={(event) => {
+							event.stopPropagation();
+							setSelectedStageFilters([]);
+						}}
+						disabled={selectedStageFilters.length === 0}
+						className={`rounded px-2 py-1 text-xs transition-colors ${
+							selectedStageFilters.length === 0
+								? "cursor-not-allowed text-slate-400"
+								: "cursor-pointer font-semibold text-[#1f4f8f] hover:bg-slate-200 hover:text-[#163a68]"
+						}`}
 					>
-						<Menu size={16} />
-						Nawigacja
+						Wyczyść filtry
 					</button>
 				</div>
 
-				<div className="min-h-0 h-full flex-1 overflow-hidden lg:pr-0 lg:pb-0 xl:pr-0 xl:pb-0">
-					{renderTabContent({
-						panelMode,
-						selectedItemId,
-						operatorLogin: authUser.login,
-						isObserver,
-						authRole: authUser.role,
-						canEditDictionaries,
-					})}
+				{isInspectionSummaryCollapsed ? null : (
+			<div id="inspection-summary-panel" className="px-2.5 pt-1.5 pb-1 text-slate-900">
+
+				{stageSummaryError ? (
+					<p className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 text-xs">
+						{stageSummaryError}
+					</p>
+				) : null}
+
+				{isStageSummaryLoading ? (
+					<div className="flex h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+						Ładowanie wykresu etapów...
+					</div>
+				) : visibleStageStatuses.length === 0 ? (
+					<div className="flex h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+						Brak danych etapów do wykresu.
+					</div>
+				) : (
+					<div className="grid grid-cols-1 items-start gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(480px,620px)]">
+						<div className="rounded-xl border border-slate-300 bg-white p-1.5">
+							<div
+								className={`welcome-scroll-subtle pr-1 ${
+									shouldShowInspectionStatusScroll ? "overflow-y-auto" : "overflow-y-hidden"
+								}`}
+								style={{ maxHeight: `${INSPECTION_STATUS_LIST_MAX_HEIGHT_PX}px` }}
+							>
+								{visibleStageStatuses.map((status, index) => {
+									const isSelected = selectedStageFilters.some(
+										(filter) => filter.stageCode === status.stageCode,
+									);
+									const statusColor = STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length];
+									const statusLegendColor = resolveStatusBackgroundColor(
+										[status.stageCode, status.stageLabel],
+										inspectionStatusStyleByCode,
+									);
+									const isZero = status.count === 0;
+
+									return (
+										<button
+											key={`${status.stageCode}-${status.stageLabel}`}
+											type="button"
+											onClick={() => {
+												setSelectedStageFilters((current) => {
+													const isAlreadySelected = current.some(
+														(filter) => filter.stageCode === status.stageCode,
+													);
+
+													if (isAlreadySelected) {
+														return current.filter(
+															(filter) => filter.stageCode !== status.stageCode,
+														);
+													}
+
+													return [
+														...current,
+														{
+															stageCode: status.stageCode,
+															stageLabel: status.stageLabel,
+														},
+													];
+												});
+											}}
+											className={`grid w-full grid-cols-[56px_auto_minmax(0,1fr)] items-center border-slate-200 border-b px-2.5 py-1.5 text-left text-sm transition-colors last:border-b-0 ${
+												isSelected
+													? "cursor-pointer bg-[#dbeafe] ring-1 ring-inset ring-[#93c5fd] shadow-[inset_3px_0_0_#2563eb]"
+													: "cursor-pointer hover:bg-slate-50"
+											}`}
+										>
+												<span className="mr-2 inline-flex items-center justify-center">
+													<span
+														className="inline-block h-4 w-8 rounded-[4px] border border-slate-300"
+														style={{ backgroundColor: statusLegendColor }}
+													/>
+												</span>
+												<span className="mr-3 flex items-center justify-start pr-2">
+													<span
+														className={`inline-flex items-center justify-center rounded-full px-2.5 py-0.5 font-semibold text-[11px] tabular-nums ${
+															isZero
+																? "bg-slate-200 text-slate-700"
+																: "text-white shadow-[inset_0_-1px_0_rgba(255,255,255,0.2)]"
+														}`}
+														style={
+															isZero
+																? { width: "2.5rem" }
+																: { width: "2.5rem", backgroundColor: statusColor }
+														}
+													>
+													{status.count}
+												</span>
+											</span>
+												<span className="min-w-0 whitespace-normal break-words text-slate-700 text-sm leading-snug">
+													{status.stageLabel}
+												</span>
+										</button>
+									);
+								})}
+							</div>
+						</div>
+
+						{stageOverviewData.length > 0 ? (
+							<div className="flex min-h-[370px] rounded-xl border border-slate-300 bg-white p-1.5">
+								<div className="grid h-full w-full grid-cols-1 items-center">
+									<div className="relative mx-auto h-[290px] w-full max-w-[560px] sm:h-[340px] lg:h-full lg:min-h-[340px]">
+										<ResponsiveContainer width="100%" height="100%">
+											<PieChart margin={{ top: 16, right: 16, bottom: 16, left: 16 }}>
+												<Pie
+													data={stageOverviewData}
+													dataKey="count"
+													nameKey="stageGroupLabel"
+													cx="50%"
+													cy="50%"
+													innerRadius="58%"
+													outerRadius="92%"
+													paddingAngle={2}
+													isAnimationActive={false}
+													activeIndex={hoveredStageSliceIndex ?? undefined}
+													onMouseEnter={(_entry, index) => setHoveredStageSliceIndex(index)}
+													onMouseLeave={() => setHoveredStageSliceIndex(null)}
+													labelLine={false}
+													label={({
+														cx,
+														cy,
+														midAngle,
+														innerRadius,
+														outerRadius,
+														value,
+													}) => {
+														if (
+															typeof value !== "number" ||
+															value <= 0 ||
+															typeof cx !== "number" ||
+															typeof cy !== "number" ||
+															typeof midAngle !== "number" ||
+															typeof innerRadius !== "number" ||
+															typeof outerRadius !== "number"
+														) {
+															return null;
+														}
+
+														const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+														const angle = (-midAngle * Math.PI) / 180;
+														const x = cx + radius * Math.cos(angle);
+														const y = cy + radius * Math.sin(angle);
+
+														return (
+															<text
+																x={x}
+																y={y}
+																fill="#ffffff"
+																fontSize={16}
+																fontWeight={700}
+																textAnchor="middle"
+																dominantBaseline="central"
+																pointerEvents="none"
+															>
+																{value}
+															</text>
+														);
+													}}
+												>
+													{stageOverviewData.map((entry, index) => (
+														<Cell
+															key={entry.stageGroupCode}
+															opacity={
+																hoveredStageSliceIndex === null || hoveredStageSliceIndex === index
+																	? 1
+																	: 0.45
+															}
+															stroke={
+																hoveredStageSliceIndex === index ? "rgba(15,23,42,0.2)" : "transparent"
+															}
+															strokeWidth={hoveredStageSliceIndex === index ? 3 : 0}
+															fill={
+																STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length]
+															}
+														/>
+													))}
+												</Pie>
+													<Tooltip
+														content={renderDonutStatusTooltip}
+														position={{ x: 22, y: 12 }}
+														allowEscapeViewBox={{ x: true, y: true }}
+													/>
+											</PieChart>
+										</ResponsiveContainer>
+										<div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+											<div className="rounded-full border border-slate-200 bg-white/90 px-3 py-2 text-center shadow-sm backdrop-blur-[1px]">
+												<div className="font-semibold text-slate-900 text-sm leading-none">{stageOverviewTotal}</div>
+												<div className="mt-0.5 text-[10px] text-slate-500 uppercase tracking-wide">{getInspectionCountLabel(stageOverviewTotal)}</div>
+											</div>
+										</div>
+									</div>
+								</div>
+							</div>
+						) : (
+							<div className="flex min-h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+								Brak danych etapów do wykresu.
+							</div>
+						)}
+					</div>
+				)}
+			</div>
+			)}
+			</div>
+
+			<div className="min-h-0 flex-1">
+			<TableSurface
+				isLoading={isLoading}
+				errorMessage={error}
+				containerClassName="h-full"
+				scrollAreaClassName="welcome-scroll-subtle h-full min-h-0 [scrollbar-gutter:stable]"
+			>
+				<table className="w-full min-w-max border-collapse font-sans text-slate-900 text-sm">
+					<thead>
+						<tr className="bg-slate-100 text-slate-800">
+							{TABLE_COLUMNS.map((column) => (
+								<th
+									key={String(column.key)}
+									className="sticky top-0 z-10 border-slate-300 border-b bg-slate-100 px-3 py-2 text-left font-semibold"
+									style={{ width: columnWidths[column.key], minWidth: column.minWidth }}
+								>
+									<span className="block truncate pr-3">{column.label}</span>
+									<button
+										type="button"
+										onMouseDown={(event) => startColumnResize(column.key, event)}
+										className="absolute top-0 right-0 h-full w-2 cursor-col-resize border-l border-slate-300/80 bg-transparent hover:bg-slate-300/40"
+										aria-label={`Zmień szerokość kolumny ${column.label}`}
+										title="Przeciągnij, aby zmienić szerokość kolumny"
+									/>
+								</th>
+							))}
+						</tr>
+					</thead>
+					<tbody>
+						{filteredRows.length === 0 ? (
+							<tr>
+								<td colSpan={TABLE_COLUMNS.length} className="px-3 py-8 text-center text-slate-500 text-sm">
+									{selectedStageFilters.length > 0
+										? "Brak danych dla wybranego segmentu wykresu."
+										: "Brak danych do wyświetlenia."}
+								</td>
+							</tr>
+						) : null}
+
+						{filteredRows.map((row, index) => (
+									(() => {
+										const shouldHighlightRow =
+											authRole === "inspector"
+												? row.isLeaderCurrentUser
+												: authRole === "team_lead"
+													? row.isLeaderInManagerTeam
+													: false;
+										const statusBackgroundColor = resolveStatusBackgroundColor(
+											[
+												row.stageGroupCode,
+												row.stageSubgroupCode,
+												row.statusInspekcji,
+												resolveInspectionStatusLabel(row),
+											],
+											inspectionStatusStyleByCode,
+										);
+
+										return (
+									<tr
+										key={`${row.kodInspekcji}-${index}`}
+										className={`border-slate-200 border-b transition-[filter,background-color] hover:drop-shadow-[0_2px_6px_rgba(15,23,42,0.14)] last:border-b-0 ${
+											shouldHighlightRow
+												? "hover:bg-slate-50"
+												: "hover:bg-slate-50"
+										}`}
+										style={{ backgroundColor: statusBackgroundColor }}
+									>
+										{TABLE_COLUMNS.map((column, columnIndex) => (
+											<td
+												key={`${row.kodInspekcji}-${index}-${String(column.key)}`}
+												className={`px-3 py-2.5 align-top ${
+													shouldHighlightRow
+														? columnIndex === 0
+																? "border-slate-200 border-y-2 border-l-4"
+															: columnIndex === TABLE_COLUMNS.length - 1
+																	? "border-slate-200 border-y-2 border-r-2"
+																	: "border-slate-200 border-y-2"
+														: ""
+												}`}
+												style={{ width: columnWidths[column.key], minWidth: column.minWidth }}
+											>
+													<div
+														className="subtle-vertical-scroll overflow-y-auto pr-1"
+														style={{ maxHeight: `${DASHBOARD_MAX_ROW_HEIGHT_PX}px` }}
+													>
+													{column.key === "zakresInspekcji" ? (
+													(() => {
+														const scopeValue = formatDatesInDisplayText(
+															String(row[column.key] ?? "-"),
+														).trim();
+														const scopeItems = row.zakresInspekcjiItems
+															.map((item) => formatDatesInDisplayText(String(item ?? "")).trim())
+															.filter(Boolean);
+
+														if (!scopeValue || scopeValue === "-") {
+															if (scopeItems.length === 0) {
+																return "-";
+															}
+														}
+
+														if (scopeItems.length > 0) {
+															return (
+																<ol className="list-decimal space-y-1 pl-4">
+																	{scopeItems.map((scopeItem, scopeIndex) => (
+																		<li
+																			key={`${row.kodInspekcji}-${index}-${scopeIndex}`}
+																			className="whitespace-normal break-words"
+																		>
+																			{scopeItem}
+																		</li>
+																	))}
+																</ol>
+															);
+														}
+
+														return (
+															<div className="whitespace-pre-line break-words">
+																{scopeValue}
+															</div>
+														);
+													})()
+												) : column.key === "zespol" ? (
+													(() => {
+														const teamCodes = toUniqueTeamCodes(
+															row.inspectionTeamCodes,
+															row.zespolyInspekcji,
+															row.zespol,
+														);
+
+														if (teamCodes.length === 0) {
+															return "-";
+														}
+
+														return (
+															<ol className="list-decimal space-y-1 pl-4">
+																{teamCodes.map((teamCode, teamIndex) => (
+																	<li
+																		key={`${row.kodInspekcji}-${index}-${teamIndex}`}
+																		className="whitespace-normal break-words"
+																	>
+																		{teamCode}
+																	</li>
+																))}
+															</ol>
+														);
+													})()
+												) : column.key === "statusInspekcji" ? (
+													(() => {
+														const isWnType = row.inspekcja === "W";
+														const level = isWnType
+															? row.wartoscLiczbowaPrzedzialuAlt
+															: row.wartoscLiczbowaPrzedzialu;
+														const daysSinceEnd = row.liczbaDniOdKoncaInspekcjiDoDzis;
+														const showIcon = level === 1 || level === 2 || level === 3;
+														const iconClassName =
+															level === 1
+																? "text-yellow-700"
+																: level === 2
+																	? "text-orange-700"
+																	: "text-red-700";
+														const iconContainerClassName =
+															level === 1
+																? "border-yellow-300 bg-yellow-100"
+																: level === 2
+																	? "border-orange-300 bg-orange-100"
+																	: "border-red-300 bg-red-100";
+														const tooltipText =
+																	typeof daysSinceEnd === "number"
+																		? isWnType
+																			? `Minęło ${daysSinceEnd} dni od zakończenia wizyty nadzorczej - brak sporządzenia sprawozdania`
+																			: `Minęło ${daysSinceEnd} dni od zakończenia kontroli - brak sporządzonego protokołu`
+																		: isWnType
+																			? "Minęło - dni od zakończenia wizyty nadzorczej - brak sporządzenia sprawozdania"
+																			: "Minęło - dni od zakończenia kontroli - brak sporządzonego protokołu";
+															const displayedStatus = formatDatesInDisplayText(
+																String(row[column.key] ?? "-"),
+															);
+
+														return (
+															<div className="flex items-start justify-between gap-2">
+																<span className="whitespace-normal break-words">
+																	{displayedStatus}
+																</span>
+																{showIcon ? (
+																			<span
+																				className="inline-flex shrink-0"
+																				tabIndex={0}
+																				aria-label={tooltipText}
+																				onMouseEnter={(event) =>
+																					showInspectionAlertTooltip(event, tooltipText)
+																				}
+																				onMouseLeave={hideInspectionAlertTooltip}
+																				onFocus={(event) =>
+																					showInspectionAlertTooltip(event, tooltipText)
+																				}
+																				onBlur={hideInspectionAlertTooltip}
+																			>
+																				<span
+																					className={`inline-flex h-7 w-7 items-center justify-center rounded-full border shadow-[inset_0_1px_0_rgba(255,255,255,0.55)] ${iconContainerClassName}`}
+																				>
+																					<AlertTriangle className={`h-[21px] w-[21px] shrink-0 ${iconClassName}`} />
+																				</span>
+																			</span>
+																) : null}
+															</div>
+														);
+													})()
+												) : column.key === "inspekcja" ? (
+													row.inspekcja === "W" ? "WN" : row.inspekcja
+												) : column.key === "kodInspekcji" ? (
+													<button
+														type="button"
+														onClick={() => {
+															const inspectionCode = String(row.kodInspekcji ?? "").trim();
+															if (!inspectionCode || typeof window === "undefined") {
+																return;
+															}
+
+															window.sessionStorage.setItem(
+																DASHBOARD_OPEN_INSPECTION_CODE_KEY,
+																inspectionCode,
+															);
+															window.dispatchEvent(
+																new CustomEvent(DASHBOARD_OPEN_INSPECTION_EVENT, {
+																	detail: { inspectionCode },
+																}),
+															);
+														}}
+														className="cursor-pointer rounded px-1 text-left text-[#1f4f8f] underline decoration-[#9bb8de] underline-offset-2 transition-colors hover:text-[#163a68]"
+														title="Przejdź do rejestru Inspekcje i zaznacz ten rekord"
+													>
+														{String(row.kodInspekcji ?? "-")}
+													</button>
+												) : (
+																	formatDatesInDisplayText(String(row[column.key] ?? "-"))
+												)}
+													</div>
+											</td>
+										))}
+									</tr>
+										);
+									})()
+							  ))}
+					</tbody>
+				</table>
+			</TableSurface>
+			</div>
+				</>
+			) : (
+				<>
+					<div className="mb-1 shrink-0 overflow-hidden rounded-2xl border border-slate-300 bg-white">
+						<div
+							className="flex cursor-pointer items-center justify-between gap-2 border-slate-300 border-b bg-slate-100 px-3 py-2"
+							onClick={() => setIsRecommendationSummaryCollapsed((current) => !current)}
+							role="button"
+							tabIndex={0}
+							onKeyDown={(event) => {
+								if (event.key === "Enter" || event.key === " ") {
+									event.preventDefault();
+									setIsRecommendationSummaryCollapsed((current) => !current);
+								}
+							}}
+							aria-expanded={!isRecommendationSummaryCollapsed}
+							aria-controls="recommendation-summary-panel"
+						>
+							<div className="inline-flex items-center gap-2 text-left text-slate-800 text-xs transition-colors hover:text-slate-900">
+								{isRecommendationSummaryCollapsed ? (
+									<ChevronRight className="h-4 w-4 shrink-0" />
+								) : (
+									<ChevronDown className="h-4 w-4 shrink-0" />
+								)}
+								<span className="font-semibold text-sm tracking-wide">Podsumowanie zaleceń</span>
+							</div>
+
+							<button
+								type="button"
+								onClick={(event) => {
+									event.stopPropagation();
+									setSelectedRecommendationStatuses([]);
+								}}
+								disabled={selectedRecommendationStatuses.length === 0}
+								className={`rounded px-2 py-1 text-xs transition-colors ${
+									selectedRecommendationStatuses.length === 0
+										? "cursor-not-allowed text-slate-400"
+										: "cursor-pointer font-semibold text-[#1f4f8f] hover:bg-slate-200 hover:text-[#163a68]"
+								}`}
+							>
+								Wyczyść filtry
+							</button>
+						</div>
+
+						{isRecommendationSummaryCollapsed ? null : (
+							<div id="recommendation-summary-panel" className="px-2.5 pt-1.5 pb-1 text-slate-900">
+
+						{recommendationSummaryError ? (
+							<p className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 text-xs">
+								{recommendationSummaryError}
+							</p>
+						) : null}
+
+						{isRecommendationSummaryLoading ? (
+							<div className="flex h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+								Ładowanie wykresu statusów...
+							</div>
+						) : orderedRecommendationGroups.length === 0 ? (
+							<div className="flex h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+								Brak statusów zaleceń.
+							</div>
+						) : (
+							<div className="grid grid-cols-1 items-start gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(480px,620px)]">
+								<div className="rounded-xl border border-slate-300 bg-white p-2.5">
+									<div
+										className={`welcome-scroll-subtle pr-1 ${
+											shouldShowRecommendationStatusScroll
+												? "overflow-y-auto"
+												: "overflow-y-hidden"
+										}`}
+										style={{ maxHeight: `${RECOMMENDATION_STATUS_LIST_MAX_HEIGHT_PX}px` }}
+									>
+										{orderedRecommendationGroups.map((group, index) => {
+											const isSelected = selectedRecommendationStatuses.some(
+												(filter) => filter.stageGroupCode === group.stageGroupCode,
+											);
+											const statusColor = STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length];
+											const statusLegendColor = resolveStatusBackgroundColor(
+												[
+													group.stageGroupCode,
+													group.stageGroupShortLabel,
+													group.stageGroupLabel,
+												],
+												recommendationStatusStyleByCode,
+											);
+											const isZero = group.count === 0;
+											const statusLabel = group.stageGroupShortLabel || group.stageGroupLabel;
+
+											return (
+												<button
+													key={group.stageGroupCode}
+													type="button"
+													onClick={() => {
+														setSelectedRecommendationStatuses((current) => {
+															const alreadySelected = current.some(
+																(item) => item.stageGroupCode === group.stageGroupCode,
+															);
+															if (alreadySelected) {
+																return current.filter(
+																	(item) => item.stageGroupCode !== group.stageGroupCode,
+																);
+															}
+
+															return [
+																...current,
+																{
+																	stageGroupCode: group.stageGroupCode,
+																	stageGroupLabel: group.stageGroupLabel,
+																	stageGroupShortLabel: group.stageGroupShortLabel,
+																},
+															];
+														});
+													}}
+													className={`grid w-full grid-cols-[56px_auto_minmax(0,1fr)] items-center border-slate-200 border-b px-2.5 py-1.5 text-left text-sm transition-colors last:border-b-0 ${
+														isSelected
+															? "cursor-pointer bg-[#dbeafe] ring-1 ring-inset ring-[#93c5fd] shadow-[inset_3px_0_0_#2563eb]"
+															: "cursor-pointer hover:bg-slate-50"
+													}`}
+												>
+														<span className="mr-2 inline-flex items-center justify-center">
+															<span
+																className="inline-block h-4 w-8 rounded-[4px] border border-slate-300"
+																style={{ backgroundColor: statusLegendColor }}
+															/>
+														</span>
+															<span className="mr-3 flex items-center justify-start pr-2">
+														<span
+															className={`inline-flex min-w-9 items-center justify-center rounded-full px-2.5 py-0.5 font-semibold text-[11px] tabular-nums ${
+																isZero
+																	? "bg-slate-200 text-slate-700"
+																	: "text-white shadow-[inset_0_-1px_0_rgba(255,255,255,0.2)]"
+															}`}
+															style={isZero ? undefined : { backgroundColor: statusColor }}
+														>
+															{group.count}
+														</span>
+													</span>
+															<span className="min-w-0 whitespace-normal break-words text-slate-700 text-sm leading-snug">
+																{statusLabel}
+															</span>
+												</button>
+											);
+										})}
+									</div>
+								</div>
+
+								{recommendationOverviewData.length > 0 ? (
+									<div className="flex min-h-[370px] rounded-xl border border-slate-300 bg-white p-2.5">
+										<div className="grid h-full w-full grid-cols-1 items-center">
+											<div className="relative mx-auto h-[290px] w-full max-w-[560px] sm:h-[340px] lg:h-full lg:min-h-[340px]">
+												<ResponsiveContainer width="100%" height="100%">
+													<PieChart margin={{ top: 16, right: 16, bottom: 16, left: 16 }}>
+														<Pie
+															data={recommendationOverviewData}
+															dataKey="count"
+															nameKey="stageGroupLabel"
+															cx="50%"
+															cy="50%"
+															innerRadius="58%"
+															outerRadius="92%"
+															paddingAngle={2}
+															isAnimationActive={false}
+															activeIndex={hoveredRecommendationSliceIndex ?? undefined}
+															onMouseEnter={(_entry, index) => setHoveredRecommendationSliceIndex(index)}
+															onMouseLeave={() => setHoveredRecommendationSliceIndex(null)}
+															labelLine={false}
+															label={({
+																cx,
+																cy,
+																midAngle,
+																innerRadius,
+																outerRadius,
+																value,
+															}) => {
+																if (
+																	typeof value !== "number" ||
+																	value <= 0 ||
+																	typeof cx !== "number" ||
+																	typeof cy !== "number" ||
+																	typeof midAngle !== "number" ||
+																	typeof innerRadius !== "number" ||
+																	typeof outerRadius !== "number"
+																) {
+																	return null;
+																}
+
+																const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+																const angle = (-midAngle * Math.PI) / 180;
+																const x = cx + radius * Math.cos(angle);
+																const y = cy + radius * Math.sin(angle);
+
+																return (
+																	<text
+																		x={x}
+																		y={y}
+																		fill="#ffffff"
+																		fontSize={16}
+																		fontWeight={700}
+																		textAnchor="middle"
+																		dominantBaseline="central"
+																		pointerEvents="none"
+																	>
+																		{value}
+																	</text>
+																);
+															}}
+														>
+															{recommendationOverviewData.map((entry, index) => (
+																<Cell
+																	key={entry.stageGroupCode}
+																	opacity={
+																		hoveredRecommendationSliceIndex === null ||
+																		hoveredRecommendationSliceIndex === index
+																			? 1
+																			: 0.45
+																	}
+																	stroke={
+																		hoveredRecommendationSliceIndex === index
+																			? "rgba(15,23,42,0.2)"
+																			: "transparent"
+																	}
+																	strokeWidth={hoveredRecommendationSliceIndex === index ? 3 : 0}
+																	fill={STAGE_OVERVIEW_COLORS[index % STAGE_OVERVIEW_COLORS.length]}
+																/>
+															))}
+														</Pie>
+														<Tooltip
+															content={renderDonutStatusTooltip}
+															position={{ x: 22, y: 12 }}
+															allowEscapeViewBox={{ x: true, y: true }}
+														/>
+													</PieChart>
+												</ResponsiveContainer>
+												<div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+													<div className="rounded-full border border-slate-200 bg-white/90 px-3 py-2 text-center shadow-sm backdrop-blur-[1px]">
+														<div className="font-semibold text-slate-900 text-sm leading-none">
+															{recommendationOverviewTotal}
+														</div>
+														<div className="mt-0.5 text-[10px] text-slate-500 uppercase tracking-wide">Zalecenia</div>
+													</div>
+												</div>
+											</div>
+										</div>
+									</div>
+								) : (
+									<div className="flex min-h-[300px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+										Brak danych statusów do wykresu.
+									</div>
+								)}
+									</div>
+								)}
+							</div>
+						)}
+					</div>
+
+					<div className="min-h-0 flex-1">
+						<TableSurface
+							isLoading={isRecommendationsLoading}
+							errorMessage={recommendationsError}
+							containerClassName="h-full"
+							scrollAreaClassName="welcome-scroll-subtle h-full min-h-0 [scrollbar-gutter:stable]"
+						>
+							<table className="w-full min-w-max border-collapse font-sans text-slate-900 text-sm">
+								<thead>
+									<tr className="bg-slate-100 text-slate-800">
+										{RECOMMENDATION_TABLE_COLUMNS.map((column) => (
+											<th
+												key={String(column.key)}
+												className="sticky top-0 z-10 border-slate-300 border-b bg-slate-100 px-3 py-2 text-left font-semibold"
+												style={{
+													width: recommendationColumnWidths[column.key],
+													minWidth: column.minWidth,
+												}}
+											>
+												<span className="block truncate pr-3">{column.label}</span>
+												<button
+													type="button"
+													onMouseDown={(event) =>
+														startRecommendationColumnResize(column.key, event)
+													}
+													className="absolute top-0 right-0 h-full w-2 cursor-col-resize border-l border-slate-300/80 bg-transparent hover:bg-slate-300/40"
+													aria-label={`Zmień szerokość kolumny ${column.label}`}
+													title="Przeciągnij, aby zmienić szerokość kolumny"
+												/>
+											</th>
+										))}
+									</tr>
+								</thead>
+								<tbody>
+									{filteredRecommendationRows.length === 0 ? (
+										<tr>
+											<td
+												colSpan={RECOMMENDATION_TABLE_COLUMNS.length}
+												className="px-3 py-8 text-center text-slate-500 text-sm"
+											>
+												{selectedRecommendationStatuses.length > 0
+													? "Brak danych dla wybranego statusu zaleceń."
+													: "Brak danych do wyświetlenia."}
+											</td>
+										</tr>
+									) : null}
+
+									{filteredRecommendationRows.map((row, index) => (
+										(() => {
+											const statusBackgroundColor = resolveStatusBackgroundColor(
+												[row.status, row.statusSkrot],
+												recommendationStatusStyleByCode,
+											);
+
+											return (
+										<tr
+											key={`${row.recommendationId}-${row.inspectionId}-${index}`}
+											className="border-slate-200 border-b bg-white transition-colors last:border-b-0 hover:bg-slate-50"
+											style={{ backgroundColor: statusBackgroundColor }}
+										>
+											{RECOMMENDATION_TABLE_COLUMNS.map((column) => (
+												<td
+													key={`${row.recommendationId}-${row.inspectionId}-${index}-${String(column.key)}`}
+													className="px-3 py-2.5 align-top"
+													style={{
+														width: recommendationColumnWidths[column.key],
+														minWidth: column.minWidth,
+													}}
+												>
+													<div
+														className="subtle-vertical-scroll overflow-y-auto pr-1"
+														style={{ maxHeight: `${DASHBOARD_MAX_ROW_HEIGHT_PX}px` }}
+													>
+													{column.key === "terminWykonaniaZalecen" ? (
+														(() => {
+															const value = formatDatesInDisplayText(
+																String(row[column.key] ?? "-"),
+															);
+															const terms = value
+																.split(",")
+																.map((item) => item.trim())
+																.filter(Boolean);
+
+															if (terms.length <= 1) {
+																return value;
+															}
+
+															return (
+																<div className="space-y-1">
+																	{terms.map((term, termIndex) => (
+																		<div key={`${row.recommendationId}-${termIndex}`}>{term}</div>
+																	))}
+																</div>
+															);
+														})()
+															) : column.key === "zespol" ? (
+																(() => {
+																	const teamCodes = toUniqueTeamCodes(
+																		row.inspectionTeamCodes,
+																		row.zespolyInspekcji,
+																		row.zespol,
+																	);
+
+																	if (teamCodes.length === 0) {
+																		return "-";
+																	}
+
+																	return (
+																		<ol className="list-decimal space-y-1 pl-4">
+																			{teamCodes.map((teamCode, teamIndex) => (
+																				<li
+																					key={`${row.recommendationId}-${row.inspectionId}-${index}-${teamIndex}`}
+																					className="whitespace-normal break-words"
+																				>
+																					{teamCode}
+																				</li>
+																			))}
+																		</ol>
+																	);
+																})()
+													) : column.key === "inspectionId" ? (
+														(() => {
+															const inspectionCode = String(row.inspectionId ?? "").trim();
+															if (!inspectionCode || inspectionCode === "-") {
+																return "-";
+															}
+
+															return (
+																<button
+																	type="button"
+																	onClick={() => {
+																		if (typeof window === "undefined") {
+																			return;
+																		}
+
+																		window.sessionStorage.setItem(
+																			DASHBOARD_OPEN_INSPECTION_CODE_KEY,
+																			inspectionCode,
+																		);
+																		window.dispatchEvent(
+																			new CustomEvent(DASHBOARD_OPEN_INSPECTION_EVENT, {
+																				detail: { inspectionCode },
+																			}),
+																		);
+																	}}
+																	className="cursor-pointer rounded px-1 text-left text-[#1f4f8f] underline decoration-[#9bb8de] underline-offset-2 transition-colors hover:text-[#163a68]"
+																	title="Przejdź do rejestru Inspekcje i zaznacz ten rekord"
+																>
+																	{inspectionCode}
+																</button>
+															);
+														})()
+													) : column.key === "recommendationId" ? (
+														(() => {
+															const recommendationCode = String(row.recommendationId ?? "").trim();
+															if (!recommendationCode || recommendationCode === "-") {
+																return "-";
+															}
+
+															return (
+																<button
+																	type="button"
+																	onClick={() => {
+																		if (typeof window === "undefined") {
+																			return;
+																		}
+
+																		window.sessionStorage.setItem(
+																			DASHBOARD_OPEN_RECOMMENDATION_CODE_KEY,
+																			recommendationCode,
+																		);
+																		window.dispatchEvent(
+																			new CustomEvent(DASHBOARD_OPEN_RECOMMENDATION_EVENT, {
+																				detail: { recommendationCode },
+																			}),
+																		);
+																	}}
+																	className="cursor-pointer rounded px-1 text-left text-[#1f4f8f] underline decoration-[#9bb8de] underline-offset-2 transition-colors hover:text-[#163a68]"
+																	title="Przejdź do rejestru Zalecenia i zaznacz ten rekord"
+																>
+																	{recommendationCode}
+																</button>
+															);
+														})()
+													) : (
+														column.key === "status"
+															? String(row.status ?? row.statusSkrot ?? "-")
+															: formatDatesInDisplayText(String(row[column.key] ?? "-"))
+													)}
+													</div>
+												</td>
+											))}
+										</tr>
+											);
+										})()
+									))}
+								</tbody>
+							</table>
+						</TableSurface>
+					</div>
+				</>
+			)}
+
+			{inspectionAlertTooltip ? (
+				<div
+					role="tooltip"
+					className="pointer-events-none fixed z-[90] w-[min(20rem,calc(100vw-1rem))] whitespace-pre-line rounded-md border border-slate-300 bg-white px-3 py-2 text-slate-700 text-sm leading-5 shadow-lg"
+					style={{ left: inspectionAlertTooltip.x, top: inspectionAlertTooltip.y }}
+				>
+					{inspectionAlertTooltip.text}
 				</div>
-			</main>
-		</div>
+			) : null}
+		</section>
 	);
 }
