@@ -8,6 +8,7 @@ import secrets
 import smtplib
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -39,6 +40,16 @@ ROLE_ID_TO_NAME = {
 }
 
 router = APIRouter()
+
+
+def _resolve_display_timezone() -> ZoneInfo | timezone:
+    try:
+        return ZoneInfo("Europe/Warsaw")
+    except Exception:  # noqa: BLE001
+        return timezone.utc
+
+
+DISPLAY_TZ = _resolve_display_timezone()
 
 
 class LoginRequest(BaseModel):
@@ -204,6 +215,23 @@ def _password_reset_ttl_minutes() -> int:
     return parsed if parsed > 0 else 60
 
 
+def _format_expires_at_for_email(expires_at: str) -> str:
+    raw = str(expires_at or "").strip()
+    if not raw:
+        return raw
+
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return raw
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _build_password_reset_link(token: str, frontend_reset_password_url: str | None = None) -> str:
     # Hardcoded production URL to keep reset links stable across env/payload mismatches.
     base = "http://172.25.210.87:3002/reset-password"
@@ -290,10 +318,11 @@ def _send_password_reset_email(to_email: str, login: str, reset_link: str, expir
             ]
         )
 
+    expires_at_display = _format_expires_at_for_email(expires_at)
     body = (
         template_text.replace("{{LOGIN}}", login)
         .replace("{{RESET_LINK}}", reset_link)
-        .replace("{{EXPIRES_AT}}", expires_at)
+        .replace("{{EXPIRES_AT}}", expires_at_display)
     )
 
     msg = EmailMessage()
