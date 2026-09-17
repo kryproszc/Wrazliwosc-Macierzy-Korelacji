@@ -205,9 +205,11 @@ def _password_reset_ttl_minutes() -> int:
 
 
 def _build_password_reset_link(token: str, frontend_reset_password_url: str | None = None) -> str:
+    env_base = (os.getenv("FRONTEND_RESET_PASSWORD_URL") or "").strip()
+    request_base = (frontend_reset_password_url or "").strip()
     base = (
-        frontend_reset_password_url
-        or os.getenv("FRONTEND_RESET_PASSWORD_URL")
+        env_base
+        or request_base
         or "http://172.25.210.87:3002/reset-password"
     ).strip()
     if not base:
