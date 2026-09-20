@@ -1,18 +1,14 @@
-from pypdf import PdfReader, PdfWriter
-
-input_pdf = "palgrave.gpp.2510116.pdf"
-output_pdf = "palgrave.gpp.2510116_z_haslem.pdf"
-password = "MojeHaslo123"
-
-reader = PdfReader(input_pdf)
-writer = PdfWriter()
-
-for page in reader.pages:
-    writer.add_page(page)
-
-writer.encrypt(password)
-
-with open(output_pdf, "wb") as f:
-    writer.write(f)
-
-print("Gotowe - PDF został zabezpieczony hasłem.")
+Wejdź do katalogu aplikacji.
+Usuń stare zależności:
+Remove-Item node_modules -Recurse -Force -ErrorAction SilentlyContinue
+Wyczyść cache npm:
+npm cache clean --force
+Upewnij się, że masz stabilną wersję npm:
+npm -v
+Jeśli trzeba:
+npm install -g npm@10.8.2
+Zainstaluj zależności:
+npm install --no-audit --no-fund
+Uruchom jak wcześniej:
+npm run build
+npm run start
