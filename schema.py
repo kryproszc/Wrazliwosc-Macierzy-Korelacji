@@ -1,19 +1,20 @@
-Zrób teraz tylko to, bez zmiany kodu:
-
-Ustaw nowy cache npm:
-npm config set cache D:\npm-cache-temp --global
-
-Usuń stare moduły:
+Ustaw cache na istniejący katalog, np. na C:
+New-Item -ItemType Directory -Force -Path C:\npm-cache-temp
+npm config set cache C:\npm-cache-temp --global
+Wyczyść stan instalacji:
 Remove-Item node_modules -Recurse -Force -ErrorAction SilentlyContinue
-
-Instalacja z nowym cache:
-npm ci --cache D:\npm-cache-temp --no-audit --no-fund
-
-Potem:
+Remove-Item package-lock.json -Force -ErrorAction SilentlyContinue
+npm cache clean --force
+Zainstaluj ponownie:
+npm install --cache C:\npm-cache-temp --no-audit --no-fund
+Potem uruchom:
 npm run build
 npm run start
+Jeśli dalej padnie:
 
-Jeśli krok 3 dalej padnie, wtedy:
-
-npx -y npm@10.8.2 ci --cache D:\npm-cache-temp --no-audit --no-fund
-jeśli nadal błąd, przeinstaluj Node.js LTS 20.x na serwerze i powtórz kroki.
+Sprawdź połączenie z rejestrem:
+npm ping
+Usuń ewentualne stare proxy:
+npm config delete proxy
+npm config delete https-proxy
+Powtórz npm install z cache na C:.
