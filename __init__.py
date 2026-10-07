@@ -1,3103 +1,2398 @@
-from __future__ import annotations
-
-import csv
-import base64
-from collections import defaultdict
-from datetime import date, datetime
-from email.message import EmailMessage
-import importlib
-import io
-import os
-import re
-import smtplib
-from statistics import median
-from typing import Any, Literal
-import unicodedata
-
-from fastapi import APIRouter, Header, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-
-from app.api.reports.generation_data import build_year_count_sections
-from app.db import get_connection
-from app.permissions import (
-	PERMISSION_RECOMMENDATIONS_READ,
-	PERMISSION_REPORTS_EXECUTED_INSPECTIONS_READ,
-	PERMISSION_REPORTS_PROTOCOL_TIME_READ,
-	PERMISSION_REPORTS_REPORT_TIME_READ,
-	require_permission,
-)
-
-
-router = APIRouter()
-
-
-class InspectionsMatrixRow(BaseModel):
-	nazwa_podmiotu: str
-	rodzaj_podmiotu: str
-	wartosci: dict[str, str]
-	cells: dict[str, list[dict[str, Any]]]
-
-
-class InspectionsMatrixResponse(BaseModel):
-	formatVersion: str
-	lata: list[str]
-	rows: list[InspectionsMatrixRow]
-
-
-class InspectionsDetailedRow(BaseModel):
-	kod_inspekcji: str
-	nazwa_podmiotu: str
-	nazwa_podmiotu_skrocona: str | None = None
-	nazwa_podmiotu_skrot: str | None = None
-	nazwaPodmiotuSkrocona: str | None = None
-	nazwaPodmiotuSkrot: str | None = None
-	rodzaj_podmiotu: str | None = None
-	inspekcja: str
-	typ_inspekcji: str | None = None
-	status: str | None = None
-	status_inspekcji_skrot: str | None = None
-	status_inspekcji_id: int | None = None
-	status_inspekcji: str | None = None
-	zakres_inspekcji: str | None = None
-	zakres_inspekcji_items: list[str] = []
-	typ_zakres_inspekcji: str
-	rok_poczatku: str
-	poczatek_inspekcji: str
-	koniec_inspekcji: str
-	inspektor_kierujacy: str
-	is_leader_current_user: bool = False
-	is_leader_in_manager_team: bool = False
-	is_member_current_user: bool = False
-	is_member_in_manager_team: bool = False
-	liczba_dni_od_konca_inspekcji_do_dzis: int | None = None
-	wartosc_liczbowa_przedzialu: int | None = None
-	wartosc_liczbowa_przedzialu_alt: int | None = None
-	osoba_kierujaca: str
-	zespol_osoby_kierujacej_kod: str
-	zespol: str = ""
-	zespolyInspekcji: str = ""
-	zespoly: str = ""
-	inspection_team_codes: list[str] = []
-	inspectionTeamCodes: list[str] = []
-	inspection_team_ids: list[int] = []
-	inspectionTeamIds: list[int] = []
-	data_protokolu_sprawozdania: str | None = None
-	roznica_dni_miedzy_data_protokolu_a_koncem: int | None = None
-
-
-class InspectionsDetailedResponse(BaseModel):
-	rows: list[InspectionsDetailedRow]
-
-
-class InspectionsTimeAnalyticsResponse(BaseModel):
-	inspectionType: str
-	trendMode: str
-	selectedMetric: str
-	selectedMetricLabel: str
-	baseCount: int
-	filteredCount: int
-	departmentMinTime: int | None = None
-	departmentMaxTime: int | None = None
-	departmentMinTimeByYear: dict[str, int | None] = {}
-	departmentMaxTimeByYear: dict[str, int | None] = {}
-	myCountByYear: dict[str, int] = {}
-	myCountByYearBreakdown: dict[str, dict[str, int]] = {}
-	myMetricByYearBreakdown: dict[str, dict[str, float]] = {}
-	myCountAllYearsBreakdown: dict[str, int] = {}
-	myMetricAllYearsBreakdown: dict[str, float] = {}
-	teamOptions: list[str]
-	yearOptions: list[str]
-	detailRows: list[dict[str, Any]]
-	summaryColumns: list[dict[str, str]] = []
-	summaryRows: list[dict[str, Any]]
-	summaryPivotYears: list[str] = []
-	summaryPivotRows: list[dict[str, Any]] = []
-	trendRows: list[dict[str, Any]]
-	scatterRows: list[dict[str, Any]]
-	overallColumns: list[dict[str, str]] = []
-	overallRows: list[dict[str, Any]] = []
-	yearCountColumns: list[str] = []
-	yearCountRows: list[dict[str, Any]] = []
-	yearCountByTeamColumns: list[str] = []
-	yearCountByTeamRows: list[dict[str, Any]] = []
-	alertStatusCounts: list[dict[str, Any]] = []
-	alertPiszemyProtokolCount: int = 0
-
-
-class StageSummarySubgroup(BaseModel):
-	stageSubgroupCode: str
-	stageSubgroupLabel: str
-	stageSubgroupOrder: int
-	count: int
-	countTeam: int
-	countManagerAdded: int
-	countTeamAndManagerAdded: int
-
-
-class StageSummaryGroup(BaseModel):
-	stageGroupCode: str
-	stageGroupLabel: str
-	stageGroupOrder: int
-	count: int
-	countTeam: int
-	countManagerAdded: int
-	countTeamAndManagerAdded: int
-	subgroups: list[StageSummarySubgroup]
-
-
-class StageSummaryFlatSubgroup(BaseModel):
-	stageGroupCode: str
-	stageGroupLabel: str
-	stageGroupOrder: int
-	stageSubgroupCode: str
-	stageSubgroupLabel: str
-	stageSubgroupOrder: int
-	count: int
-	countTeam: int
-	countManagerAdded: int
-	countTeamAndManagerAdded: int
-
-
-class InspectionsStageSummaryResponse(BaseModel):
-	generatedAt: str
-	stageDictionaryVersion: str
-	totalInspections: int
-	qualityErrorCount: int
-	statuses: list[RecommendationStatusGroup]
-
-
-class RecommendationStatusGroup(BaseModel):
-	stageGroupCode: str
-	stageGroupLabel: str
-	stageGroupShortLabel: str | None = None
-	stageGroupOrder: int
-	count: int
-	countTeam: int
-	countManagerAdded: int
-	countTeamAndManagerAdded: int
-
-
-class RecommendationsStageSummaryResponse(BaseModel):
-	generatedAt: str
-	stageDictionaryVersion: str
-	totalRecommendations: int
-	qualityErrorCount: int
-	groups: list[RecommendationStatusGroup]
-
-
-class RecommendationsDetailedRow(BaseModel):
-	status: str
-	status_skrot: str | None = None
-	statusSkrot: str | None = None
-	kod_zalecenia: str | None = None
-	kod_inspekcji: str | None = None
-	kodZalecenia: str | None = None
-	kodInspekcji: str | None = None
-	nazwa_podmiotu: str
-	nazwa_podmiotu_skrocona: str | None = None
-	nazwa_podmiotu_skrot: str | None = None
-	nazwaPodmiotuSkrocona: str | None = None
-	nazwaPodmiotuSkrot: str | None = None
-	data_zalecen: str | None = None
-	termin_zalecen: str | None = None
-	termin_wykonania_zalecen: str | None = None
-	zespol: str = ""
-	zespolyInspekcji: str = ""
-	zespoly: str = ""
-	inspection_team_codes: list[str] = []
-	inspectionTeamCodes: list[str] = []
-	inspection_team_ids: list[int] = []
-	inspectionTeamIds: list[int] = []
-	liczba_zalecen: int
-
-
-class RecommendationsDetailedResponse(BaseModel):
-	rows: list[RecommendationsDetailedRow]
-
-
-ReportExportType = Literal["inspections", "recommendations"]
-
-
-class ReportExportEmailRequest(BaseModel):
-	reportTypes: list[ReportExportType] = Field(default_factory=lambda: ["inspections", "recommendations"])
-	toEmails: list[str]
-	subject: str | None = None
-	body: str | None = None
-	managerUserId: int | None = None
-
-
-class ReportExportEmailResponse(BaseModel):
-	sentCount: int
-	attachmentNames: list[str]
-
-
-DashboardRequestedFileFormat = Literal["html", "pdf"]
-
-
-class DashboardHtmlMeta(BaseModel):
-	generatedAt: str | None = None
-	requestedFileFormat: DashboardRequestedFileFormat | None = None
-	activeTopSection: str | None = None
-	includedSections: list[str] | None = None
-	filters: dict[str, Any] | None = None
-	sender: dict[str, Any] | None = None
-
-
-class DashboardSendHtmlRequest(BaseModel):
-	toEmails: list[str] = Field(default_factory=list)
-	subject: str | None = None
-	bodyText: str | None = None
-	fileName: str
-	pdfBase64: str | None = None
-	html: str | None = None
-	reportType: ReportExportType
-	meta: DashboardHtmlMeta | None = None
-
-
-class DashboardSendHtmlResponse(BaseModel):
-	message: str
-	recipientEmail: str
-	fileName: str
-	fileFormat: DashboardRequestedFileFormat
-
-
-STAGE_DICTIONARY_VERSION = "1.0.0"
-RECOMMENDATIONS_STAGE_DICTIONARY_VERSION = "1.0.0"
-
-STAGE_GROUPS: list[dict[str, Any]] = [
-	{
-		"code": "pre",
-		"label": "Przed inspekcja",
-		"order": 1,
-		"subgroups": [
-			{"code": "pre_planned", "label": "Plan", "order": 1},
-			{"code": "pre_preparation", "label": "Przygotowanie", "order": 2},
-		],
-	},
-	{
-		"code": "during",
-		"label": "W trakcie inspekcji",
-		"order": 2,
-		"subgroups": [
-			{"code": "in_progress_active", "label": "Trwa", "order": 1},
-			{"code": "in_progress_report_writing", "label": "Zakonczona - piszemy", "order": 2},
-		],
-	},
-	{
-		"code": "post",
-		"label": "Po inspekcji",
-		"order": 3,
-		"subgroups": [
-			{"code": "post_protocol_sent", "label": "Przekazano protokol", "order": 1},
-			{"code": "post_post_visit_letter_sent", "label": "Przekazano pismo po wizycie", "order": 2},
-			{"code": "post_objections_received", "label": "Wplynely zastrzezenia", "order": 3},
-			{"code": "post_post_visit_response_received", "label": "Wplynela odpowiedz po wizycie", "order": 4},
-		],
-	},
-	{
-		"code": "recommendations",
-		"label": "Rekomendacje",
-		"order": 4,
-		"subgroups": [
-			{"code": "rec_writing_recommendations", "label": "Piszemy zalecenia/odstapienie", "order": 1},
-			{"code": "rec_findings_letter", "label": "Pismo ustalenia", "order": 2},
-		],
-	},
-	{
-		"code": "closed",
-		"label": "Zamkniete inspekcje",
-		"order": 5,
-		"subgroups": [
-			{"code": "closed_with_recommendations", "label": "Zamkniete - wydano zalecenia", "order": 1},
-			{"code": "closed_without_recommendations", "label": "Zamkniete - brak zalecen", "order": 2},
-		],
-	},
-	{
-		"code": "unknown",
-		"label": "Nieprzypisane",
-		"order": 99,
-		"subgroups": [
-			{"code": "unknown_unmapped", "label": "Brak mapowania", "order": 1},
-		],
-	},
-]
-
-STAGE_SUBGROUP_INDEX: dict[str, dict[str, Any]] = {
-	subgroup["code"]: {
-		"stage_group_code": group["code"],
-		"stage_group_label": group["label"],
-		"stage_group_order": int(group["order"]),
-		"stage_subgroup_code": subgroup["code"],
-		"stage_subgroup_label": subgroup["label"],
-		"stage_subgroup_order": int(subgroup["order"]),
-	}
-	for group in STAGE_GROUPS
-	for subgroup in group["subgroups"]
-}
-
-
-def _resolve_operator(conn: Any, operator_login: str | None) -> dict[str, Any]:
-	login = (operator_login or "").strip()
-	if not login:
-		raise HTTPException(status_code=401, detail="Operator nie istnieje")
-
-	row = conn.execute(
-		"""
-		SELECT id, login, rola_id, zespol_id, aktywny
-		FROM users
-		WHERE lower(login)=lower(?)
-		LIMIT 1
-		""",
-		(login,),
-	).fetchone()
-	if row is None:
-		raise HTTPException(status_code=401, detail="Operator nie istnieje")
-
-	operator = dict(row)
-	if int(operator["aktywny"]) != 1:
-		raise HTTPException(status_code=403, detail="Operator jest nieaktywny")
-
-	return operator
-
-
-def _year_from_date(value: str | None) -> str | None:
-	if value is None:
-		return None
-	cleaned = value.strip()
-	if len(cleaned) < 4:
-		return None
-	year = cleaned[:4]
-	if not year.isdigit():
-		return None
-	return year
-
-
-def _matrix_cell_value(typ_inspekcji: str | None, zakres_inspekcji: str | None) -> str:
-	typ_clean = (typ_inspekcji or "").strip()
-	zakres_clean = (zakres_inspekcji or "").strip()
-
-	first_letter = typ_clean[:1].upper() if typ_clean else ""
-	if first_letter and zakres_clean:
-		parts = [part.strip() for part in re.split(r"[;,]", zakres_clean) if part.strip()]
-		if parts:
-			return ", ".join(f"{first_letter}_{part}" for part in parts)
-		return f"{first_letter}_{zakres_clean}"
-	return "-"
-
-
-def _parse_iso_date(value: str | None) -> date | None:
-	if value is None:
-		return None
-	cleaned = value.strip()
-	if len(cleaned) < 10:
-		return None
-	try:
-		return date.fromisoformat(cleaned[:10])
-	except ValueError:
-		return None
-
-
-def _days_difference(date_from: str | None, date_to: str | None) -> int | None:
-	left = _parse_iso_date(date_from)
-	right = _parse_iso_date(date_to)
-	if left is None or right is None:
-		return None
-	# Analytics in "czas protokolu" should not expose negative durations.
-	return max((left - right).days, 0)
-
-
-def _days_from_end_to_today(end_date: str | None) -> int | None:
-	parsed_end = _parse_iso_date(end_date)
-	if parsed_end is None:
-		return None
-	return (date.today() - parsed_end).days
-
-
-def _end_to_today_bucket(days_value: int | None) -> int | None:
-	if days_value is None:
-		return None
-	if days_value < 21:
-		return 0
-	if days_value < 28:
-		return 1
-	if days_value < 35:
-		return 2
-	return 3
-
-
-def _end_to_today_bucket_alt(days_value: int | None) -> int | None:
-	if days_value is None:
-		return None
-	if days_value < 14:
-		return 0
-	if days_value < 21:
-		return 1
-	if days_value < 28:
-		return 2
-	return 3
-
-
-def _inspekcja_code(typ_inspekcji: str | None) -> str:
-	cleaned = (typ_inspekcji or "").strip().lower()
-	if cleaned.startswith("kontrola"):
-		return "K"
-	if cleaned.startswith("wizyta nadzorcza"):
-		return "W"
-	return "-"
-
-
-def _matrix_type_code(typ_inspekcji: str | None) -> str:
-	code = _inspekcja_code(typ_inspekcji)
-	if code == "W":
-		return "WN"
-	return code
-
-
-def _normalize_matrix_scopes(raw_scopes: str | None) -> list[str]:
-	if raw_scopes is None:
-		return []
-	parts: list[str] = []
-	for part in str(raw_scopes).split(";"):
-		cleaned = part.strip()
-		if cleaned and cleaned != "-":
-			parts.append(cleaned)
-	# Keep insertion order while removing duplicates.
-	return list(dict.fromkeys(parts))
-
-
-def _parse_scope_id_csv(raw_scope_ids: str | None) -> list[int]:
-	if raw_scope_ids is None:
-		return []
-	ids: list[int] = []
-	for part in str(raw_scope_ids).split(";"):
-		cleaned = part.strip()
-		if not cleaned:
-			continue
-		try:
-			ids.append(int(cleaned))
-		except ValueError:
-			continue
-	# Keep insertion order while removing duplicates.
-	return list(dict.fromkeys(ids))
-
-
-def _scope_items_from_ids_csv(conn: Any, raw_scope_ids: str | None, cache: dict[int, str]) -> list[str]:
-	scope_ids = _parse_scope_id_csv(raw_scope_ids)
-	if not scope_ids:
-		return []
-
-	missing_ids = [scope_id for scope_id in scope_ids if scope_id not in cache]
-	if missing_ids:
-		placeholders = ",".join("?" for _ in missing_ids)
-		rows = conn.execute(
-			f"""
-			SELECT id, COALESCE(NULLIF(trim(nazwa_pozycji), ''), '-') AS scope_name
-			FROM slownik_pozycje
-			WHERE id IN ({placeholders})
-			""",
-			tuple(missing_ids),
-		).fetchall()
-		for row in rows:
-			cache[int(row["id"])] = str(row["scope_name"] or "-")
-
-	return [cache[scope_id] for scope_id in scope_ids if scope_id in cache]
-
-
-def _normalize_text_key(value: str | None) -> str:
-	cleaned = (value or "").strip().lower()
-	if not cleaned:
-		return ""
-	normalized = unicodedata.normalize("NFKD", cleaned)
-	ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
-	return " ".join(ascii_only.split())
-
-
-def _is_valid_email(value: str | None) -> bool:
-	cleaned = str(value or "").strip()
-	if not cleaned:
-		return False
-	return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", cleaned) is not None
-
-
-def _normalize_emails(values: list[str]) -> list[str]:
-	result: list[str] = []
-	seen: set[str] = set()
-	for value in values:
-		email = str(value or "").strip().lower()
-		if not _is_valid_email(email):
-			continue
-		if email in seen:
-			continue
-		seen.add(email)
-		result.append(email)
-	return result
-
-
-def _smtp_error_detail(kind: str, exc: Exception) -> dict[str, Any]:
-	debug_enabled = (os.getenv("REPORTS_EMAIL_DEBUG_ERRORS") or "0").strip().lower() in {"1", "true", "yes", "on"}
-	detail: dict[str, Any] = {
-		"code": "REPORTS_EMAIL_SMTP_ERROR",
-		"message": "Blad SMTP podczas wysylki raportu",
-		"smtpErrorType": type(exc).__name__,
-		"smtpErrorKind": kind,
-	}
-	if debug_enabled:
-		detail["smtpError"] = str(exc)
-	return detail
-
-
-def _reports_env_truthy(name: str, default: str = "0") -> bool:
-	value = (os.getenv(name, default) or "").strip().lower()
-	return value in {"1", "true", "yes", "on"}
-
-
-def _smtp_retry_attempts() -> int:
-	raw_value = (os.getenv("REPORTS_SMTP_RETRY_ATTEMPTS") or "2").strip()
-	try:
-		parsed = int(raw_value)
-	except ValueError:
-		return 2
-	return min(max(parsed, 1), 5)
-
-
-def _smtp_timeout_seconds() -> int:
-	raw_value = (os.getenv("REPORTS_SMTP_TIMEOUT_SECONDS") or "30").strip()
-	try:
-		parsed = int(raw_value)
-	except ValueError:
-		return 30
-	return min(max(parsed, 5), 120)
-
-
-def _smtp_max_message_bytes() -> int:
-	raw_value = (os.getenv("REPORTS_SMTP_MAX_MESSAGE_MB") or "24").strip()
-	try:
-		parsed_mb = int(raw_value)
-	except ValueError:
-		parsed_mb = 24
-	parsed_mb = min(max(parsed_mb, 1), 100)
-	return parsed_mb * 1024 * 1024
-
-
-def _smtp_message_too_large_detail(size_bytes: int) -> dict[str, Any]:
-	limit_bytes = _smtp_max_message_bytes()
-	return {
-		"code": "REPORTS_EMAIL_MESSAGE_TOO_LARGE",
-		"message": "Wiadomosc email przekracza limit rozmiaru serwera SMTP",
-		"limitMb": round(limit_bytes / (1024 * 1024), 2),
-		"messageSizeMb": round(size_bytes / (1024 * 1024), 2),
-	}
-
-
-def _is_smtp_size_error(exc: Exception) -> bool:
-	smtp_code = getattr(exc, "smtp_code", None)
-	if smtp_code == 552:
-		return True
-	text = str(exc).lower()
-	return "message size" in text or "maxsizeerror" in text or "exceeded" in text
-
-
-def _smtp_config() -> dict[str, Any]:
-	smtp_host = (os.getenv("SMTP_HOST") or "").strip()
-	smtp_port_raw = (os.getenv("SMTP_PORT") or "465").strip()
-	smtp_login = (os.getenv("SMTP_LOGIN") or "").strip()
-	smtp_pass = (os.getenv("SMTP_PASS") or "").strip()
-	smtp_login_mail = (os.getenv("SMTP_LOGIN_MAIL") or "").strip()
-	from_email = (os.getenv("FROM_EMAIL") or smtp_login_mail or "").strip()
-	smtp_security = (os.getenv("SMTP_SECURITY") or "starttls").strip().lower()
-
-	if smtp_security not in {"ssl", "starttls", "plain"}:
-		smtp_security = "starttls"
-
-	if not smtp_host or not smtp_login or not smtp_pass or not from_email:
-		raise RuntimeError("Brak konfiguracji SMTP")
-
-	try:
-		smtp_port = int(smtp_port_raw)
-	except ValueError as exc:
-		raise RuntimeError("Niepoprawny SMTP_PORT") from exc
-
-	return {
-		"host": smtp_host,
-		"port": smtp_port,
-		"login": smtp_login,
-		"password": smtp_pass,
-		"from_email": from_email,
-		"security": smtp_security,
-	}
-
-
-def _send_smtp_message(msg: EmailMessage, *, config: dict[str, Any]) -> None:
-	message_bytes = msg.as_bytes()
-	if len(message_bytes) > _smtp_max_message_bytes():
-		raise HTTPException(status_code=413, detail=_smtp_message_too_large_detail(len(message_bytes)))
-
-	attempts = _smtp_retry_attempts()
-	timeout_seconds = _smtp_timeout_seconds()
-	last_exc: Exception | None = None
-
-	for attempt in range(1, attempts + 1):
-		try:
-			if config["security"] == "ssl":
-				with smtplib.SMTP_SSL(config["host"], int(config["port"]), timeout=timeout_seconds) as server:
-					server.login(config["login"], config["password"])
-					server.send_message(msg)
-			else:
-				with smtplib.SMTP(config["host"], int(config["port"]), timeout=timeout_seconds) as server:
-					server.ehlo()
-					if config["security"] == "starttls":
-						server.starttls()
-						server.ehlo()
-					server.login(config["login"], config["password"])
-					server.send_message(msg)
-			return
-		except smtplib.SMTPException as exc:
-			last_exc = exc
-			print(f"[REPORTS-EMAIL][SMTP-ERROR][attempt={attempt}/{attempts}] {type(exc).__name__}: {exc}")
-			if _is_smtp_size_error(exc):
-				raise HTTPException(status_code=413, detail=_smtp_message_too_large_detail(len(message_bytes))) from exc
-			is_retryable = isinstance(exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError))
-			if is_retryable and attempt < attempts:
-				continue
-			raise HTTPException(status_code=502, detail=_smtp_error_detail("smtp", exc)) from exc
-		except OSError as exc:
-			last_exc = exc
-			print(f"[REPORTS-EMAIL][SMTP-CONNECTION-ERROR][attempt={attempt}/{attempts}] {type(exc).__name__}: {exc}")
-			if attempt < attempts:
-				continue
-			raise HTTPException(status_code=502, detail=_smtp_error_detail("connection", exc)) from exc
-
-	if last_exc is not None:
-		raise HTTPException(status_code=502, detail=_smtp_error_detail("connection", last_exc)) from last_exc
-
-
-def run_reports_startup_checks() -> None:
-	strict_mode = _reports_env_truthy("REPORTS_STARTUP_STRICT", "0")
-
-	if _reports_env_truthy("REPORTS_STARTUP_VALIDATE_PDF", "1"):
-		try:
-			sync_api_module = importlib.import_module("playwright.sync_api")
-			sync_playwright = getattr(sync_api_module, "sync_playwright")
-			with sync_playwright() as playwright:
-				browser = playwright.chromium.launch()
-				browser.close()
-			print("[REPORTS-STARTUP] PDF engine OK (Playwright + Chromium)")
-		except Exception as exc:
-			message = f"[REPORTS-STARTUP] PDF engine validation failed: {type(exc).__name__}: {exc}"
-			if strict_mode:
-				raise RuntimeError(message) from exc
-			print(message)
-
-	if _reports_env_truthy("REPORTS_STARTUP_VALIDATE_SMTP", "1"):
-		mode = (os.getenv("EMAIL_SEND_MODE") or os.getenv("INVITE_EMAIL_MODE") or "log").strip().lower()
-		if mode != "smtp":
-			print("[REPORTS-STARTUP] SMTP validation skipped (mode != smtp)")
-			return
-
-		try:
-			config = _smtp_config()
-		except RuntimeError as exc:
-			message = f"[REPORTS-STARTUP] SMTP config invalid: {exc}"
-			if strict_mode:
-				raise RuntimeError(message) from exc
-			print(message)
-			return
-
-		try:
-			timeout_seconds = _smtp_timeout_seconds()
-			if config["security"] == "ssl":
-				with smtplib.SMTP_SSL(config["host"], int(config["port"]), timeout=timeout_seconds) as server:
-					server.login(config["login"], config["password"])
-			else:
-				with smtplib.SMTP(config["host"], int(config["port"]), timeout=timeout_seconds) as server:
-					server.ehlo()
-					if config["security"] == "starttls":
-						server.starttls()
-						server.ehlo()
-					server.login(config["login"], config["password"])
-			print("[REPORTS-STARTUP] SMTP connectivity/login OK")
-		except Exception as exc:
-			message = f"[REPORTS-STARTUP] SMTP validation failed: {type(exc).__name__}: {exc}"
-			if strict_mode:
-				raise RuntimeError(message) from exc
-			print(message)
-
-
-def _csv_bytes(rows: list[dict[str, Any]], headers: list[tuple[str, str]]) -> bytes:
-	buffer = io.StringIO()
-	writer = csv.writer(buffer, delimiter=";")
-	writer.writerow([label for _, label in headers])
-	for row in rows:
-		writer.writerow([str(row.get(key) or "") for key, _ in headers])
-	# UTF-8 BOM improves default opening in Excel.
-	return buffer.getvalue().encode("utf-8-sig")
-
-
-def _report_export_payload(
-	report_type: ReportExportType,
-	*,
-	x_operator_login: str,
-	manager_user_id: int | None,
-) -> tuple[str, bytes]:
-	if report_type == "inspections":
-		payload = get_inspections_detailed(
-			manager_user_id=manager_user_id,
-			x_operator_login=x_operator_login,
-		)
-		rows = list(payload.get("rows") or [])
-		headers = [
-			("status", "Status"),
-			("kod_inspekcji", "Kod inspekcji"),
-			("nazwa_podmiotu", "Nazwa podmiotu"),
-			("rodzaj_podmiotu", "Rodzaj podmiotu"),
-			("zakres_inspekcji", "Zakres inspekcji"),
-			("inspektor_kierujacy", "Inspektor kierujacy"),
-			("zespoly", "Zespoly"),
-			("poczatek_inspekcji", "Poczatek inspekcji"),
-			("koniec_inspekcji", "Koniec inspekcji"),
-		]
-		return "inspekcje.csv", _csv_bytes(rows, headers)
-
-	payload = get_recommendations_detailed(
-		manager_user_id=manager_user_id,
-		x_operator_login=x_operator_login,
-	)
-	rows = list(payload.get("rows") or [])
-	headers = [
-		("status", "Status"),
-		("kod_zalecenia", "Kod zalecenia"),
-		("kod_inspekcji", "Kod inspekcji"),
-		("nazwa_podmiotu", "Nazwa podmiotu"),
-		("data_zalecen", "Data zalecen"),
-		("termin_zalecen", "Termin zalecen"),
-		("zespoly", "Zespoly"),
-	]
-	return "zalecenia.csv", _csv_bytes(rows, headers)
-
-
-def _send_email_with_attachments(
-	*,
-	to_email: str,
-	subject: str,
-	body: str,
-	attachments: list[tuple[str, bytes]],
-) -> None:
-	mode = (os.getenv("EMAIL_SEND_MODE") or os.getenv("INVITE_EMAIL_MODE") or "log").strip().lower()
-	if mode not in {"log", "smtp"}:
-		mode = "log"
-
-	if mode == "log":
-		print("[REPORTS-EMAIL]", f"to={to_email}", f"subject={subject}", f"attachments={','.join(name for name, _ in attachments)}")
-		return
-
-	try:
-		config = _smtp_config()
-	except RuntimeError as exc:
-		raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-	msg = EmailMessage()
-	msg["Subject"] = subject
-	msg["From"] = str(config["from_email"])
-	msg["To"] = to_email
-	msg.set_content(body)
-	for filename, content in attachments:
-		msg.add_attachment(content, maintype="text", subtype="csv", filename=filename)
-	_send_smtp_message(msg, config=config)
-
-
-def _send_email_with_typed_attachments(
-	*,
-	to_email: str,
-	subject: str,
-	body: str,
-	attachments: list[tuple[str, bytes, str]],
-) -> None:
-	mode = (os.getenv("EMAIL_SEND_MODE") or os.getenv("INVITE_EMAIL_MODE") or "log").strip().lower()
-	if mode not in {"log", "smtp"}:
-		mode = "log"
-
-	if mode == "log":
-		print("[REPORTS-EMAIL]", f"to={to_email}", f"subject={subject}", f"attachments={','.join(name for name, _, _ in attachments)}")
-		return
-
-	try:
-		config = _smtp_config()
-	except RuntimeError as exc:
-		raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-	msg = EmailMessage()
-	msg["Subject"] = subject
-	msg["From"] = str(config["from_email"])
-	msg["To"] = to_email
-	msg.set_content(body)
-	for filename, content, mime_type in attachments:
-		if "/" not in mime_type:
-			raise HTTPException(status_code=500, detail="Niepoprawny typ MIME zalacznika")
-		maintype, subtype = mime_type.split("/", 1)
-		msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
-	_send_smtp_message(msg, config=config)
-
-
-def _resolve_dashboard_recipient(conn: Any, operator_id: int) -> tuple[str, str]:
-	row = conn.execute(
-		"""
-		SELECT login, imie, nazwisko, email
-		FROM users
-		WHERE id = ?
-		LIMIT 1
-		""",
-		(int(operator_id),),
-	).fetchone()
-	if row is None:
-		raise HTTPException(status_code=401, detail="Operator nie istnieje")
-	data = dict(row)
-	email = str(data.get("email") or "").strip().lower()
-	if not _is_valid_email(email):
-		raise HTTPException(status_code=422, detail="Zalogowany uzytkownik nie ma poprawnego adresu email")
-	full_name = f"{str(data.get('imie') or '').strip()} {str(data.get('nazwisko') or '').strip()}".strip()
-	if not full_name:
-		full_name = str(data.get("login") or "").strip() or "Uzytkowniku"
-	return email, full_name
-
-
-def _dashboard_subject_date(generated_at: str | None) -> str:
-	value = str(generated_at or "").strip()
-	if value:
-		candidate = value.replace("Z", "+00:00")
-		try:
-			return datetime.fromisoformat(candidate).date().isoformat()
-		except ValueError:
-			if re.match(r"^\d{4}-\d{2}-\d{2}", value):
-				return value[:10]
-	return date.today().isoformat()
-
-
-def _resolve_dashboard_file_format(payload: DashboardSendHtmlRequest) -> DashboardRequestedFileFormat:
-	requested = str(payload.meta.requestedFileFormat).strip().lower() if payload.meta and payload.meta.requestedFileFormat else ""
-	if requested in {"html", "pdf"}:
-		return requested  # type: ignore[return-value]
-	file_name = str(payload.fileName or "").strip().lower()
-	if file_name.endswith(".pdf"):
-		return "pdf"
-	return "html"
-
-
-def _sanitize_dashboard_filename(file_name: str, target_format: DashboardRequestedFileFormat) -> str:
-	raw = os.path.basename(str(file_name or "").strip())
-	if not raw:
-		raw = f"zrzut_dashboard.{target_format}"
-	cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
-	if not cleaned:
-		cleaned = f"zrzut_dashboard.{target_format}"
-	if not cleaned.lower().endswith(f".{target_format}"):
-		base = cleaned.rsplit(".", 1)[0] if "." in cleaned else cleaned
-		cleaned = f"{base}.{target_format}"
-	return cleaned[:180]
-
-
-def _render_pdf_bytes_from_html(html: str) -> bytes:
-	try:
-		sync_api_module = importlib.import_module("playwright.sync_api")
-		sync_playwright = getattr(sync_api_module, "sync_playwright")
-	except ImportError as exc:
-		raise HTTPException(
-			status_code=500,
-			detail="Brak zaleznosci playwright. Zainstaluj pakiet i przegladarke Chromium.",
-		) from exc
-
-	try:
-		with sync_playwright() as playwright:
-			browser = playwright.chromium.launch()
-			page = browser.new_page()
-
-			def _route_request(route: Any) -> None:
-				url = str(route.request.url or "")
-				if url.startswith("http://") or url.startswith("https://"):
-					route.abort()
-					return
-				route.continue_()
-
-			page.route("**/*", _route_request)
-			page.set_content(html, wait_until="networkidle")
-			page.emulate_media(media="screen")
-			pdf = page.pdf(print_background=True, prefer_css_page_size=True)
-			browser.close()
-			return pdf
-	except HTTPException:
-		raise
-	except Exception as exc:
-		raise HTTPException(status_code=500, detail="Nie udalo sie wygenerowac PDF z HTML") from exc
-
-
-def _decode_pdf_base64(raw_value: str) -> bytes:
-	cleaned = str(raw_value or "").strip()
-	if not cleaned:
-		raise HTTPException(status_code=422, detail="pdfBase64 jest wymagane")
-	if cleaned.startswith("data:"):
-		_, _, tail = cleaned.partition(",")
-		cleaned = tail.strip()
-	try:
-		decoded = base64.b64decode(cleaned, validate=True)
-	except Exception as exc:
-		raise HTTPException(status_code=422, detail="pdfBase64 ma niepoprawny format") from exc
-	if not decoded:
-		raise HTTPException(status_code=422, detail="pdfBase64 jest puste")
-	if not decoded.startswith(b"%PDF"):
-		raise HTTPException(status_code=422, detail="Przeslany plik nie jest poprawnym PDF")
-	return decoded
-
-
-def _normalize_code_key(value: str | None) -> str:
-	cleaned = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
-	if not cleaned:
-		return ""
-	normalized = unicodedata.normalize("NFKD", cleaned)
-	ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
-	return re.sub(r"_+", "_", ascii_only)
-
-
-def _resolve_stage_subgroup_code(status_code: str | None) -> str:
-	code = _normalize_code_key(status_code)
-	if code == "plan":
-		return "pre_planned"
-	if code == "przygotowanie":
-		return "pre_preparation"
-	if code == "trwa":
-		return "in_progress_active"
-	if code == "zakonczona_piszemy":
-		return "in_progress_report_writing"
-	if code.startswith("przekazano_protoko"):
-		return "post_protocol_sent"
-	if code == "przekazano_pismo_po_wizycie":
-		return "post_post_visit_letter_sent"
-	if code == "wplynely_zastrzezenia":
-		return "post_objections_received"
-	if code == "wplynela_odp_po_wizycie":
-		return "post_post_visit_response_received"
-	if code == "piszemy_zalecenia_odstapienie":
-		return "rec_writing_recommendations"
-	if code.startswith("pismo_ustalen"):
-		return "rec_findings_letter"
-	if "zamkn" in code and ("wydano_zalec" in code or "z_zalec" in code):
-		return "closed_with_recommendations"
-	if "zamkn" in code and ("brak_zalec" in code or "bez_zalec" in code):
-		return "closed_without_recommendations"
-	return "unknown_unmapped"
-
-
-def _stage_payload_from_status_code(status_code: str | None) -> dict[str, Any]:
-	subgroup_code = _resolve_stage_subgroup_code(status_code)
-	return dict(STAGE_SUBGROUP_INDEX.get(subgroup_code, STAGE_SUBGROUP_INDEX["unknown_unmapped"]))
-
-
-def _manager_scope_flags_for_inspection(conn: Any, inspection_id: int, manager: dict[str, Any]) -> tuple[bool, bool]:
-	team_id = manager.get("zespol_id")
-	has_team = team_id is not None
-
-	leader_row = conn.execute(
-		"""
-		SELECT u.zespol_id AS leader_team_id, u.created_by_user_id AS leader_created_by
-		FROM inspections i
-		LEFT JOIN users u ON u.id = i.osoba_kierujaca_user_id
-		WHERE i.id = ?
-		LIMIT 1
-		""",
-		(int(inspection_id),),
-	).fetchone()
-
-	in_team_scope = False
-	in_added_scope = False
-	if leader_row is not None:
-		leader_team_id = leader_row["leader_team_id"]
-		leader_created_by = leader_row["leader_created_by"]
-		if has_team and leader_team_id is not None and int(leader_team_id) == int(team_id):
-			in_team_scope = True
-		if leader_created_by is not None and int(leader_created_by) == int(manager["id"]):
-			in_added_scope = True
-
-	if has_team:
-		member_row = conn.execute(
-			"""
-			SELECT
-				MAX(CASE WHEN u.zespol_id = ? THEN 1 ELSE 0 END) AS has_team_member,
-				MAX(CASE WHEN u.created_by_user_id = ? THEN 1 ELSE 0 END) AS has_added_member
-			FROM inspection_members im
-			JOIN users u ON u.id = im.user_id
-			WHERE im.inspection_id = ?
-			""",
-			(int(team_id), int(manager["id"]), int(inspection_id)),
-		).fetchone()
-	else:
-		member_row = conn.execute(
-			"""
-			SELECT
-				0 AS has_team_member,
-				MAX(CASE WHEN u.created_by_user_id = ? THEN 1 ELSE 0 END) AS has_added_member
-			FROM inspection_members im
-			JOIN users u ON u.id = im.user_id
-			WHERE im.inspection_id = ?
-			""",
-			(int(manager["id"]), int(inspection_id)),
-		).fetchone()
-	if member_row is not None:
-		in_team_scope = in_team_scope or int(member_row["has_team_member"] or 0) == 1
-		in_added_scope = in_added_scope or int(member_row["has_added_member"] or 0) == 1
-
-	return in_team_scope, in_added_scope
-
-
-def _recommendation_ids_for_manager_team(conn: Any, manager: dict[str, Any]) -> set[int]:
-	team_id = manager.get("zespol_id")
-	if team_id is None:
-		return set()
-	rows = conn.execute(
-		"""
-		SELECT DISTINCT recommendation_id
-		FROM recommendation_teams
-		WHERE team_id = ?
-		""",
-		(int(team_id),),
-	).fetchall()
-	return {
-		int(row["recommendation_id"])
-		for row in rows
-		if row["recommendation_id"] is not None
-	}
-
-
-def _public_status_label(value: str | None) -> str:
-	return str(value or "-").strip() or "-"
-
-
-def _should_compute_bucket_code(status_code: str | None) -> bool:
-	return _is_excluded_status_code(status_code, _DASHBOARD_ALERT_INSPECTION_STATUS_CODES)
-
-
-def _parse_csv_values(raw_value: str | list[str] | None) -> list[str]:
-	if raw_value is None:
-		return []
-	items = raw_value if isinstance(raw_value, list) else [raw_value]
-	parts: list[str] = []
-	for item in items:
-		for part in re.split(r"[,;\n]", str(item)):
-			cleaned = part.strip()
-			if cleaned:
-				parts.append(cleaned)
-	# Keep insertion order while removing duplicates.
-	return list(dict.fromkeys(parts))
-
-
-def _parse_int_csv_values(raw_value: str | list[str] | None) -> list[int]:
-	values: list[int] = []
-	for part in _parse_csv_values(raw_value):
-		if str(part).strip().isdigit():
-			values.append(int(str(part).strip()))
-	return values
-
-
-def _load_excluded_status_codes(env_key: str) -> set[str]:
-	raw_value = os.getenv(env_key)
-	if raw_value is None:
-		return set()
-	return {
-		normalized
-		for normalized in (_normalize_code_key(v) for v in _parse_csv_values(raw_value))
-		if normalized
-	}
-
-
-def _load_ordered_status_codes(env_key: str) -> list[str]:
-	raw_value = os.getenv(env_key)
-	if raw_value is None:
-		return []
-	ordered: list[str] = []
-	for value in _parse_csv_values(raw_value):
-		normalized = _normalize_code_key(value)
-		if normalized:
-			ordered.append(normalized)
-	# Keep insertion order while removing duplicates.
-	return list(dict.fromkeys(ordered))
-
-
-def _dashboard_status_display_order(status_code: str | None, fallback_order: int) -> int:
-	normalized = _normalize_code_key(status_code)
-	custom_index = _DASHBOARD_INSPECTION_STATUS_ORDER_INDEX.get(normalized)
-	if custom_index is not None:
-		return custom_index + 1
-	# Unlisted statuses are displayed after explicitly configured ones.
-	return 10000 + int(fallback_order)
-
-
-_DASHBOARD_EXCLUDED_INSPECTION_STATUS_CODES = _load_excluded_status_codes("DASHBOARD_EXCLUDED_INSPECTION_STATUS_CODES")
-_DASHBOARD_EXCLUDED_RECOMMENDATION_STATUS_CODES = _load_excluded_status_codes("DASHBOARD_EXCLUDED_RECOMMENDATION_STATUS_CODES")
-_DASHBOARD_INSPECTION_STATUS_ORDER_CODES = _load_ordered_status_codes("DASHBOARD_INSPECTION_STATUS_ORDER_CODES")
-_DASHBOARD_INSPECTION_STATUS_ORDER_INDEX = {
-	code: idx for idx, code in enumerate(_DASHBOARD_INSPECTION_STATUS_ORDER_CODES)
-}
-_DASHBOARD_ALERT_INSPECTION_STATUS_CODES = (
-	_load_excluded_status_codes("DASHBOARD_ALERT_INSPECTION_STATUS_CODES")
-	or {_normalize_code_key("I_SI_4")}
-)
-_REPORTS_EXCLUDED_INSPECTION_STATUS_CODES = _load_excluded_status_codes("REPORTS_EXCLUDED_INSPECTION_STATUS_CODES")
-_REPORTS_EXCLUDED_RECOMMENDATION_STATUS_CODES = _load_excluded_status_codes("REPORTS_EXCLUDED_RECOMMENDATION_STATUS_CODES")
-_MAX_DASHBOARD_HTML_MB_DEFAULT = 64
-try:
-	_MAX_DASHBOARD_HTML_MB = int((os.getenv("REPORTS_SEND_HTML_MAX_MB") or str(_MAX_DASHBOARD_HTML_MB_DEFAULT)).strip())
-except ValueError:
-	_MAX_DASHBOARD_HTML_MB = _MAX_DASHBOARD_HTML_MB_DEFAULT
-if _MAX_DASHBOARD_HTML_MB < 1:
-	_MAX_DASHBOARD_HTML_MB = _MAX_DASHBOARD_HTML_MB_DEFAULT
-_MAX_DASHBOARD_HTML_BYTES = _MAX_DASHBOARD_HTML_MB * 1024 * 1024
-
-
-def _is_excluded_status_code(status_code: str | None, excluded_codes: set[str]) -> bool:
-	return _normalize_code_key(status_code) in excluded_codes
-
-
-def _is_dashboard_hidden_status_code(status_code: str | None) -> bool:
-	return _is_excluded_status_code(status_code, _DASHBOARD_EXCLUDED_INSPECTION_STATUS_CODES)
-
-
-def _is_dashboard_hidden_recommendation_status_code(status_code: str | None) -> bool:
-	return _is_excluded_status_code(status_code, _DASHBOARD_EXCLUDED_RECOMMENDATION_STATUS_CODES)
-
-
-def _is_reports_hidden_status_code(status_code: str | None) -> bool:
-	return _is_excluded_status_code(status_code, _REPORTS_EXCLUDED_INSPECTION_STATUS_CODES)
-
-
-def _is_reports_hidden_recommendation_status_code(status_code: str | None) -> bool:
-	return _is_excluded_status_code(status_code, _REPORTS_EXCLUDED_RECOMMENDATION_STATUS_CODES)
-
-
-def _can_access_inspection_for_reports(conn: Any, inspection_row: dict[str, Any], operator: dict[str, Any]) -> bool:
-	if int(operator["rola_id"]) == 3:
-		return True
-	if int(operator["rola_id"]) == 4:
-		return True
-
-	inspection_id = int(inspection_row["id"])
-
-	if int(operator["rola_id"]) == 2:
-		operator_team_id = operator.get("zespol_id")
-		has_team = operator_team_id is not None
-
-		if has_team:
-			leader_row = conn.execute(
-				"""
-				SELECT 1
-				FROM inspections i
-				JOIN users u ON u.id = i.osoba_kierujaca_user_id
-				WHERE i.id = ?
-				  AND (
-				      u.zespol_id = ?
-				      OR u.created_by_user_id = ?
-				  )
-				LIMIT 1
-				""",
-				(inspection_id, int(operator_team_id), int(operator["id"])),
-			).fetchone()
-		else:
-			leader_row = conn.execute(
-				"""
-				SELECT 1
-				FROM inspections i
-				JOIN users u ON u.id = i.osoba_kierujaca_user_id
-				WHERE i.id = ?
-				  AND u.created_by_user_id = ?
-				LIMIT 1
-				""",
-				(inspection_id, int(operator["id"])),
-			).fetchone()
-		if leader_row is not None:
-			return True
-
-		if has_team:
-			member_team_row = conn.execute(
-				"""
-				SELECT 1
-				FROM inspection_members im
-				JOIN users u ON u.id = im.user_id
-				WHERE im.inspection_id = ?
-				  AND (
-				      u.zespol_id = ?
-				      OR u.created_by_user_id = ?
-				  )
-				LIMIT 1
-				""",
-				(inspection_id, int(operator_team_id), int(operator["id"])),
-			).fetchone()
-		else:
-			member_team_row = conn.execute(
-				"""
-				SELECT 1
-				FROM inspection_members im
-				JOIN users u ON u.id = im.user_id
-				WHERE im.inspection_id = ?
-				  AND u.created_by_user_id = ?
-				LIMIT 1
-				""",
-				(inspection_id, int(operator["id"])),
-			).fetchone()
-		return member_team_row is not None
-
-	created_by_user_id = inspection_row.get("created_by_user_id")
-	if created_by_user_id is not None and int(created_by_user_id) == int(operator["id"]):
-		return True
-
-	member_row = conn.execute(
-		"SELECT 1 FROM inspection_members WHERE inspection_id = ? AND user_id = ? LIMIT 1",
-		(inspection_id, int(operator["id"])),
-	).fetchone()
-	if member_row is not None:
-		return True
-
-	leader_row = conn.execute(
-		"SELECT 1 FROM inspections WHERE id = ? AND osoba_kierujaca_user_id = ? LIMIT 1",
-		(inspection_id, int(operator["id"])),
-	).fetchone()
-	return leader_row is not None
-
-
-def _can_access_recommendation_for_reports(conn: Any, recommendation_row: dict[str, Any], operator: dict[str, Any]) -> bool:
-	if int(operator["rola_id"]) == 3:
-		return True
-
-	inspection_id_raw = recommendation_row.get("inspection_id")
-	if inspection_id_raw is not None:
-		inspection_row = {
-			"id": int(inspection_id_raw),
-			"created_by_user_id": recommendation_row.get("inspection_created_by_user_id"),
-		}
-		return _can_access_inspection_for_reports(conn, inspection_row, operator)
-
-	author_id_raw = recommendation_row.get("recommendation_created_by_user_id")
-	if author_id_raw is None:
-		return False
-	author_id = int(author_id_raw)
-
-	if author_id == int(operator["id"]):
-		return True
-
-	if int(operator["rola_id"]) == 2:
-		author_team_id = recommendation_row.get("recommendation_author_team_id")
-		author_created_by = recommendation_row.get("recommendation_author_created_by_user_id")
-		if author_created_by is not None and int(author_created_by) == int(operator["id"]):
-			return True
-		operator_team_id = operator.get("zespol_id")
-		if operator_team_id is None or author_team_id is None:
-			return False
-		return int(author_team_id) == int(operator_team_id)
-
-	return False
-
-
-def _safe_average(values: list[int]) -> float | None:
-	if not values:
-		return None
-	return float(sum(values)) / float(len(values))
-
-
-def _metric_from_values(values: list[int], trend_mode: str) -> float | None:
-	if not values:
-		return None
-	if trend_mode == "average":
-		return _safe_average(values)
-	return float(median(values))
-
-
-def _is_member_current_user(conn: Any, inspection_id: int, operator_id: int) -> bool:
-	row = conn.execute(
-		"SELECT 1 FROM inspection_members WHERE inspection_id = ? AND user_id = ? LIMIT 1",
-		(int(inspection_id), int(operator_id)),
-	).fetchone()
-	return row is not None
-
-
-def _is_leader_in_manager_scope(conn: Any, leader_user_id: int | None, operator: dict[str, Any]) -> bool:
-	if int(operator.get("rola_id", 0)) != 2:
-		return False
-	if leader_user_id is None:
-		return False
-	operator_team_id = operator.get("zespol_id")
-	if operator_team_id is None:
-		return False
-	row = conn.execute(
-		"""
-		SELECT 1
-		FROM users u
-		WHERE u.id = ?
-		  AND (
-		      u.zespol_id = ?
-		      OR u.created_by_user_id = ?
-		  )
-		LIMIT 1
-		""",
-		(int(leader_user_id), int(operator_team_id), int(operator["id"])),
-	).fetchone()
-	return row is not None
-
-
-def _is_member_in_manager_scope(conn: Any, inspection_id: int, operator: dict[str, Any]) -> bool:
-	if int(operator.get("rola_id", 0)) != 2:
-		return False
-	operator_team_id = operator.get("zespol_id")
-	if operator_team_id is None:
-		return False
-	row = conn.execute(
-		"""
-		SELECT 1
-		FROM inspection_members im
-		JOIN users u ON u.id = im.user_id
-		WHERE im.inspection_id = ?
-		  AND (
-		      u.zespol_id = ?
-		      OR u.created_by_user_id = ?
-		  )
-		LIMIT 1
-		""",
-		(int(inspection_id), int(operator_team_id), int(operator["id"])),
-	).fetchone()
-	return row is not None
-
-
-@router.get("/api/reports/inspections-time-analytics", response_model=InspectionsTimeAnalyticsResponse)
-def get_inspections_time_analytics(
-	x_operator_login: str | None = Header(default=None, alias="X-Operator-Login"),
-	inspectionType: str = Query(...),
-	trendMode: str = Query("median"),
-	teams: str | None = Query(default=None),
-	years: list[str] | None = Query(default=None),
-) -> dict[str, Any]:
-	inspection_type = inspectionType.strip().upper()
-	if inspection_type not in {"K", "W"}:
-		raise HTTPException(status_code=400, detail="inspectionType musi byc K albo W")
-
-	trend_mode = trendMode.strip().lower()
-	if trend_mode not in {"average", "median"}:
-		raise HTTPException(status_code=400, detail="trendMode musi byc average albo median")
-	metric_label = "Srednia" if trend_mode == "average" else "Mediana"
-
-	# Frontend may pass teams='-' from stale/default state; treat it as no team filter.
-	team_filter = {
-		str(value).strip()
-		for value in _parse_csv_values(teams)
-		if str(value).strip() not in {"", "-"}
-	}
-	year_filter = set(_parse_csv_values(years))
-
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_REPORTS_REPORT_TIME_READ)
-		if int(operator["rola_id"]) not in {1, 2, 3, 4}:
-			raise HTTPException(status_code=403, detail="Brak uprawnien")
-
-		operator_team_id = int(operator["zespol_id"]) if operator.get("zespol_id") is not None else None
-		operator_team_code = "-"
-		if operator_team_id is not None:
-			team_row = conn.execute("SELECT kod FROM teams WHERE id = ? LIMIT 1", (operator_team_id,)).fetchone()
-			if team_row is not None:
-				operator_team_code = str(team_row["kod"] or "-").strip() or "-"
-
-		operator_member_inspections: set[int] = set()
-		operator_member_rows = conn.execute(
-			"""
-			SELECT DISTINCT inspection_id
-			FROM inspection_members
-			WHERE user_id = ?
-			""",
-			(int(operator["id"]),),
-		).fetchall()
-		operator_member_inspections = {int(item["inspection_id"]) for item in operator_member_rows}
-
-		rows = conn.execute(
-			"""
-			SELECT
-				i.id,
-				i.kod_inspekcji,
-				i.created_by_user_id,
-				i.osoba_kierujaca_user_id,
-				i.poczatek_inspekcji,
-				i.koniec_inspekcji,
-				i.data_protokolu_sprawozdania,
-				i.status_inspekcji_id,
-				COALESCE(si.kod_pozycji, '') AS status_inspekcji_kod,
-				ti.nazwa_pozycji AS typ_inspekcji,
-				COALESCE(si.nazwa_pozycji, '-') AS status_inspekcji,
-				COALESCE(NULLIF(trim(si.skrot_pozycji), ''), si.nazwa_pozycji, '-') AS status_inspekcji_skrot,
-				COALESCE(NULLIF(trim(np.skrot_pozycji), ''), np.nazwa_pozycji, '-') AS nazwa_podmiotu,
-				(
-					SELECT group_concat(x.scope_name, '; ')
-					FROM (
-						SELECT COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-') AS scope_name
-						FROM inspection_scopes isc
-						JOIN slownik_pozycje sp ON sp.id = isc.scope_id
-						WHERE isc.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-')), sp.id
-					) x
-				) AS zakres_inspekcji,
-				(
-					SELECT group_concat(x.scope_id, ';')
-					FROM (
-						SELECT CAST(isc.scope_id AS TEXT) AS scope_id
-						FROM inspection_scopes isc
-						JOIN slownik_pozycje sp ON sp.id = isc.scope_id
-						WHERE isc.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-')), sp.id
-					) x
-				) AS zakres_inspekcji_ids_csv,
-				COALESCE(u.login, '-') AS osoba_kierujaca,
-				COALESCE(t.kod, '-') AS zespol_osoby_kierujacej_kod,
-				u.zespol_id AS lead_team_id,
-				(
-					SELECT group_concat(x.team_code, ', ')
-					FROM (
-						SELECT DISTINCT COALESCE(NULLIF(trim(tt.kod), ''), '-') AS team_code
-						FROM inspection_teams it
-						JOIN teams tt ON tt.id = it.team_id
-						WHERE it.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(tt.kod), ''), '-')), tt.id
-					) x
-				) AS inspection_team_codes,
-				(
-					SELECT group_concat(x.team_id, ',')
-					FROM (
-						SELECT DISTINCT CAST(it.team_id AS TEXT) AS team_id
-						FROM inspection_teams it
-						WHERE it.inspection_id = i.id
-						ORDER BY it.team_id ASC
-					) x
-				) AS inspection_team_ids_csv
-			FROM inspections i
-			LEFT JOIN slownik_pozycje ti ON ti.id = i.typ_inspekcji_id
-			LEFT JOIN slownik_pozycje si ON si.id = i.status_inspekcji_id
-			LEFT JOIN slownik_pozycje np ON np.id = i.nazwa_podmiotu_id
-			LEFT JOIN users u ON u.id = i.osoba_kierujaca_user_id
-			LEFT JOIN teams t ON t.id = u.zespol_id
-			ORDER BY i.id ASC
-			"""
-		).fetchall()
-
-	typed_rows: list[dict[str, Any]] = []
-	all_type_base_rows: list[dict[str, Any]] = []
-	base_rows: list[dict[str, Any]] = []
-	scope_name_cache: dict[int, str] = {}
-	for raw_row in rows:
-		row = dict(raw_row)
-		if _is_reports_hidden_status_code(row.get("status_inspekcji_kod")):
-			continue
-		row_type = _inspekcja_code(row.get("typ_inspekcji"))
-		if row_type not in {"K", "W"}:
-			continue
-
-		diff = _days_difference(row.get("data_protokolu_sprawozdania"), row.get("koniec_inspekcji"))
-		year = _year_from_date(row.get("poczatek_inspekcji"))
-		team_code = str(row.get("zespol_osoby_kierujacej_kod") or "-").strip() or "-"
-		status_label = _public_status_label(row.get("status_inspekcji"))
-		stage_payload = _stage_payload_from_status_code(row.get("status_inspekcji_kod"))
-		inspection_id = int(row["id"])
-		inspection_team_codes = [
-			value.strip()
-			for value in str(row.get("inspection_team_codes") or "").split(",")
-			if value.strip()
-		]
-		inspection_team_ids = [
-			int(value)
-			for value in str(row.get("inspection_team_ids_csv") or "").split(",")
-			if value.strip().isdigit()
-		]
-		leader_user_id = row.get("osoba_kierujaca_user_id")
-		is_leader_current_user = leader_user_id is not None and int(leader_user_id) == int(operator["id"])
-		is_member_current_user = inspection_id in operator_member_inspections
-		zakres_inspekcji_raw = str(row.get("zakres_inspekcji") or "-").strip() or "-"
-		zakres_inspekcji_items = _scope_items_from_ids_csv(conn, row.get("zakres_inspekcji_ids_csv"), scope_name_cache)
-		normalized_row = {
-			"inspectionId": inspection_id,
-			"kodInspekcji": str(row.get("kod_inspekcji") or "-").strip() or "-",
-			"inspekcja": row_type,
-			"statusInspekcjiId": int(row["status_inspekcji_id"]) if row.get("status_inspekcji_id") is not None else None,
-			"statusInspekcji": status_label,
-				"statusInspekcjiSkrot": str(row.get("status_inspekcji_skrot") or status_label or "-").strip() or "-",
-			"nazwaPodmiotu": str(row.get("nazwa_podmiotu") or "-").strip() or "-",
-				"zakresInspekcji": zakres_inspekcji_raw,
-				"zakresInspekcjiItems": zakres_inspekcji_items,
-			"osobaKierujaca": str(row.get("osoba_kierujaca") or "-").strip() or "-",
-			"rokPoczatku": year,
-			"poczatekInspekcji": row.get("poczatek_inspekcji"),
-			"koniecInspekcji": row.get("koniec_inspekcji"),
-			"data": row.get("data_protokolu_sprawozdania"),
-			"zespol": team_code,
-			"inspectionTeamCodes": inspection_team_codes,
-			"inspectionTeamIds": inspection_team_ids,
-			"zespolyInspekcji": ", ".join(inspection_team_codes) if inspection_team_codes else "-",
-			"czas": diff,
-			"isLeaderCurrentUser": is_leader_current_user,
-			"isMemberCurrentUser": is_member_current_user,
-			"leadTeamId": row.get("lead_team_id"),
-			"stageGroupCode": stage_payload["stage_group_code"],
-			"stageGroupLabel": stage_payload["stage_group_label"],
-			"stageGroupOrder": stage_payload["stage_group_order"],
-			"stageSubgroupCode": stage_payload["stage_subgroup_code"],
-			"stageSubgroupLabel": stage_payload["stage_subgroup_label"],
-			"stageSubgroupOrder": stage_payload["stage_subgroup_order"],
-		}
-
-		all_type_base_rows.append(normalized_row)
-
-		if row_type != inspection_type:
-			continue
-
-		typed_rows.append(normalized_row)
-
-		base_rows.append(normalized_row)
-
-	if year_filter:
-		rows_after_year = [row for row in base_rows if str(row.get("rokPoczatku") or "") in year_filter]
-	else:
-		rows_after_year = list(base_rows)
-
-	if team_filter:
-		filtered_rows = [row for row in rows_after_year if str(row.get("zespol") or "") in team_filter]
-	else:
-		filtered_rows = list(rows_after_year)
-
-	# Year-count section is intentionally based on all inspection types (K + W)
-	# and mirrors permission + team filtering used by this report.
-	rows_for_counts = list(all_type_base_rows)
-	if year_filter:
-		rows_for_counts = [row for row in rows_for_counts if str(row.get("rokPoczatku") or "") in year_filter]
-	if team_filter:
-		rows_for_counts = [row for row in rows_for_counts if str(row.get("zespol") or "") in team_filter]
-
-	(
-		year_count_columns,
-		year_count_rows,
-		year_count_by_team_columns,
-		year_count_by_team_rows,
-	) = build_year_count_sections(rows_for_counts, inspection_type)
-
-	team_options = sorted({str(row["zespol"]) for row in base_rows if str(row.get("zespol") or "") not in {"", "-"}})
-	year_options = sorted({str(row["rokPoczatku"]) for row in base_rows if row.get("rokPoczatku") is not None}, reverse=True)
-	# Business rule: inspector must receive the same dataset as director/team_lead in this report.
-	is_personal_scope_mode = False
-
-	def _is_valid_for_aggregations(row: dict[str, Any]) -> bool:
-		if row.get("rokPoczatku") is None:
-			return False
-		czas_value = row.get("czas")
-		return isinstance(czas_value, (int, float))
-
-	if is_personal_scope_mode:
-		if year_filter:
-			department_min_max_source = [
-				row
-				for row in typed_rows
-				if str(row.get("rokPoczatku") or "") in year_filter and _is_valid_for_aggregations(row)
-			]
-		else:
-			department_min_max_source = [row for row in typed_rows if _is_valid_for_aggregations(row)]
-	else:
-		department_min_max_source = [row for row in rows_after_year if _is_valid_for_aggregations(row)]
-
-	department_times_for_bounds = [int(row["czas"]) for row in department_min_max_source]
-	department_min_time = min(department_times_for_bounds) if department_times_for_bounds else None
-	department_max_time = max(department_times_for_bounds) if department_times_for_bounds else None
-
-	agg_filtered_rows = [row for row in filtered_rows if _is_valid_for_aggregations(row)]
-	department_scope_rows = [row for row in rows_after_year if _is_valid_for_aggregations(row)]
-
-	summary_rows: list[dict[str, Any]] = []
-	overall_rows: list[dict[str, Any]] = []
-	all_year_metric_by_team: dict[str, float | None] = {}
-	overall_metric_key = "average" if trend_mode == "average" else "median"
-	overall_metric_label = "Srednia" if trend_mode == "average" else "Mediana"
-
-	if is_personal_scope_mode:
-		if year_filter:
-			typed_rows_after_year = [row for row in typed_rows if str(row.get("rokPoczatku") or "") in year_filter]
-		else:
-			typed_rows_after_year = list(typed_rows)
-		typed_rows_all_year = list(typed_rows_after_year)
-
-		department_user_scope_all_year = [row for row in typed_rows_all_year if _is_valid_for_aggregations(row)]
-
-		department_user_scope = [row for row in typed_rows_after_year if _is_valid_for_aggregations(row)]
-
-		team_user_scope: list[dict[str, Any]] = []
-		team_user_scope_all_year: list[dict[str, Any]] = []
-		if operator_team_id is not None:
-			for row in typed_rows_all_year:
-				if not _is_valid_for_aggregations(row):
-					continue
-				lead_team_id = row.get("leadTeamId")
-				is_team_row = lead_team_id is not None and int(lead_team_id) == int(operator_team_id)
-				if is_team_row:
-					team_user_scope_all_year.append(row)
-
-			for row in typed_rows_after_year:
-				if not _is_valid_for_aggregations(row):
-					continue
-				lead_team_id = row.get("leadTeamId")
-				is_team_row = lead_team_id is not None and int(lead_team_id) == int(operator_team_id)
-				if is_team_row:
-					team_user_scope.append(row)
-
-		my_user_scope_all_year = [
-			row
-			for row in base_rows
-			if _is_valid_for_aggregations(row)
-			and (bool(row.get("isLeaderCurrentUser")) or bool(row.get("isMemberCurrentUser")))
-		]
-		my_user_scope = [
-			row
-			for row in rows_after_year
-			if _is_valid_for_aggregations(row)
-			and (bool(row.get("isLeaderCurrentUser")) or bool(row.get("isMemberCurrentUser")))
-		]
-
-		dept_groups: dict[str, list[int]] = defaultdict(list)
-		for row in department_user_scope:
-			dept_groups[str(row["rokPoczatku"])].append(int(row["czas"]))
-
-		team_groups: dict[str, list[int]] = defaultdict(list)
-		for row in team_user_scope:
-			team_groups[str(row["rokPoczatku"])].append(int(row["czas"]))
-
-		my_groups: dict[str, list[int]] = defaultdict(list)
-		for row in my_user_scope:
-			my_groups[str(row["rokPoczatku"])].append(int(row["czas"]))
-
-		all_years = sorted(set(dept_groups.keys()) | set(team_groups.keys()) | set(my_groups.keys()))
-		for year in all_years:
-			for scope_name, values in (
-				("Departament", dept_groups.get(year, [])),
-				(operator_team_code, team_groups.get(year, [])),
-				("Moj czas", my_groups.get(year, [])),
-			):
-				if not values:
-					continue
-				avg_value = _safe_average(values)
-				med_value = float(median(values)) if values else None
-				metric_value = avg_value if trend_mode == "average" else med_value
-				summary_rows.append(
-					{
-						"rok": year,
-						"zespol": scope_name,
-						"year": year,
-						"team": scope_name,
-						"count": len(values),
-						"average": avg_value,
-						"median": med_value,
-						"min": min(values),
-						"max": max(values),
-						"metric": metric_value,
-					}
-				)
-
-		for scope_name, rows_scope in (
-			("Departament", department_user_scope),
-			(operator_team_code, team_user_scope),
-			("Moj czas", my_user_scope),
-		):
-			values = [int(item["czas"]) for item in rows_scope]
-			if not values:
-				continue
-			avg_value = _safe_average(values)
-			med_value = float(median(values)) if values else None
-			metric_value = avg_value if trend_mode == "average" else med_value
-			overall_rows.append(
-				{
-					"zespol": scope_name,
-					"count": len(values),
-					"average": avg_value,
-					"median": med_value,
-					"min": min(values),
-					"max": max(values),
-					"metric": metric_value,
-				}
-			)
-
-		for scope_name, rows_scope in (
-			("Departament", department_user_scope_all_year),
-			(operator_team_code, team_user_scope_all_year),
-			("Moj czas", my_user_scope_all_year),
-		):
-			values = [int(item["czas"]) for item in rows_scope]
-			if not values:
-				continue
-			all_year_metric_by_team[scope_name] = _metric_from_values(values, trend_mode)
-	else:
-		summary_groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-		for row in agg_filtered_rows:
-			summary_groups[(str(row["rokPoczatku"]), str(row["zespol"]))].append(int(row["czas"]))
-
-		for (year, team), values in sorted(summary_groups.items(), key=lambda item: (item[0][0], item[0][1])):
-			avg_value = _safe_average(values)
-			med_value = float(median(values)) if values else None
-			metric_value = avg_value if trend_mode == "average" else med_value
-			summary_rows.append(
-				{
-					"rok": year,
-					"zespol": team,
-					"year": year,
-					"team": team,
-					"count": len(values),
-					"average": avg_value,
-					"median": med_value,
-					"min": min(values) if values else None,
-					"max": max(values) if values else None,
-					"metric": metric_value,
-				}
-			)
-
-		department_groups: dict[str, list[int]] = defaultdict(list)
-		for row in department_scope_rows:
-			department_groups[str(row["rokPoczatku"])].append(int(row["czas"]))
-
-		for year, values in sorted(department_groups.items(), key=lambda item: item[0]):
-			avg_value = _safe_average(values)
-			med_value = float(median(values)) if values else None
-			metric_value = avg_value if trend_mode == "average" else med_value
-			summary_rows.append(
-				{
-					"rok": year,
-					"zespol": "Departament",
-					"year": year,
-					"team": "Departament",
-					"count": len(values),
-					"average": avg_value,
-					"median": med_value,
-					"min": min(values) if values else None,
-					"max": max(values) if values else None,
-					"metric": metric_value,
-				}
-			)
-
-		team_all_year_groups: dict[str, list[int]] = defaultdict(list)
-		for row in rows_after_year:
-			if not _is_valid_for_aggregations(row):
-				continue
-			if team_filter and str(row.get("zespol") or "") not in team_filter:
-				continue
-			team_all_year_groups[str(row["zespol"])].append(int(row["czas"]))
-
-		for team_name, values in team_all_year_groups.items():
-			all_year_metric_by_team[team_name] = _metric_from_values(values, trend_mode)
-
-		department_all_year_values = [int(row["czas"]) for row in rows_after_year if _is_valid_for_aggregations(row)]
-		if department_all_year_values:
-			all_year_metric_by_team["Departament"] = _metric_from_values(department_all_year_values, trend_mode)
-
-		# Overall rows for general summary table (all years, same dataset for count/metric).
-		for team_name, values in sorted(team_all_year_groups.items(), key=lambda item: item[0]):
-			if not values:
-				continue
-			avg_value = _safe_average(values)
-			med_value = float(median(values)) if values else None
-			overall_rows.append(
-				{
-					"zespol": team_name,
-					"count": len(values),
-					"average": avg_value,
-					"median": med_value,
-					overall_metric_key: avg_value if trend_mode == "average" else med_value,
-					"metric": avg_value if trend_mode == "average" else med_value,
-				}
-			)
-
-		if department_all_year_values:
-			dept_avg = _safe_average(department_all_year_values)
-			dept_median = float(median(department_all_year_values)) if department_all_year_values else None
-			overall_rows.append(
-				{
-					"zespol": "Departament",
-					"count": len(department_all_year_values),
-					"average": dept_avg,
-					"median": dept_median,
-					overall_metric_key: dept_avg if trend_mode == "average" else dept_median,
-					"metric": dept_avg if trend_mode == "average" else dept_median,
-				}
-			)
-
-	trend_groups: dict[str, list[int]] = defaultdict(list)
-	for row in agg_filtered_rows:
-		trend_groups[str(row["rokPoczatku"])].append(int(row["czas"]))
-
-	trend_rows: list[dict[str, Any]] = []
-	for year, values in sorted(trend_groups.items(), key=lambda item: item[0]):
-		if not str(year).isdigit():
-			continue
-		avg_value = _safe_average(values)
-		med_value = float(median(values)) if values else None
-		trend_rows.append(
-			{
-				"year": int(year),
-				"count": len(values),
-				"average": avg_value,
-				"median": med_value,
-				"min": min(values) if values else None,
-				"max": max(values) if values else None,
-				"trend": avg_value if trend_mode == "average" else med_value,
-			}
-		)
-
-	department_year_values: dict[str, list[int]] = defaultdict(list)
-	for row in department_min_max_source:
-		year_key = str(row.get("rokPoczatku") or "").strip()
-		if not year_key:
-			continue
-		department_year_values[year_key].append(int(row["czas"]))
-
-	target_years_for_bounds: list[str]
-	if year_filter:
-		target_years_for_bounds = sorted({str(item).strip() for item in year_filter if str(item).strip()})
-	else:
-		target_years_for_bounds = [str(item["year"]) for item in trend_rows if item.get("year") is not None]
-
-	department_min_time_by_year: dict[str, int | None] = {}
-	department_max_time_by_year: dict[str, int | None] = {}
-	for year_key in target_years_for_bounds:
-		year_values = department_year_values.get(year_key, [])
-		department_min_time_by_year[year_key] = min(year_values) if year_values else None
-		department_max_time_by_year[year_key] = max(year_values) if year_values else None
-
-	summary_pivot_years = sorted({str(row.get("rok")) for row in summary_rows if row.get("rok") not in {None, ""}})
-	pivot_team_order: list[str] = []
-	pivot_team_values: dict[str, dict[str, float]] = {}
-	for row in summary_rows:
-		team_name = str(row.get("zespol") or "").strip()
-		year_value = str(row.get("rok") or "").strip()
-		metric_value = row.get("metric")
-		if not team_name or not year_value or not isinstance(metric_value, (int, float)):
-			continue
-		if team_name not in pivot_team_values:
-			pivot_team_values[team_name] = {}
-			pivot_team_order.append(team_name)
-		pivot_team_values[team_name][year_value] = float(metric_value)
-
-	summary_pivot_rows: list[dict[str, Any]] = []
-	for team_name in all_year_metric_by_team.keys():
-		if team_name not in pivot_team_order:
-			pivot_team_order.append(team_name)
-	include_all_years_pivot = is_personal_scope_mode or bool(year_filter)
-	if include_all_years_pivot and "allYears" not in summary_pivot_years:
-		summary_pivot_years.append("allYears")
-	for team_name in pivot_team_order:
-		values = {
-			year: float(pivot_team_values[team_name].get(year) or 0)
-			for year in summary_pivot_years
-			if year != "allYears"
-		}
-		if include_all_years_pivot:
-			values["allYears"] = float(all_year_metric_by_team.get(team_name) or 0)
-		summary_pivot_rows.append(
-			{
-				"zespol": team_name,
-				"values": values,
-			}
-		)
-
-	detail_source_rows = [row for row in filtered_rows if _is_valid_for_aggregations(row)]
-	if is_personal_scope_mode:
-		detail_source_rows = [
-			row
-			for row in detail_source_rows
-			if bool(row.get("isLeaderCurrentUser")) or bool(row.get("isMemberCurrentUser"))
-		]
-
-	detail_rows = [
-		{
-			"inspectionId": row["inspectionId"],
-			"inspekcja": row["inspekcja"],
-			"kontrola": row["kodInspekcji"],
-			"kodInspekcji": row["kodInspekcji"],
-			"kod_inspekcji": row["kodInspekcji"],
-			"year": row.get("rokPoczatku") or "-",
-			"rokPoczatku": row.get("rokPoczatku") or "-",
-			"statusInspekcjiId": row.get("statusInspekcjiId"),
-			"statusInspekcji": row.get("statusInspekcji") or "-",
-			"status": row.get("statusInspekcji") or "-",
-			"stage_group_code": row.get("stageGroupCode"),
-			"stage_group_label": row.get("stageGroupLabel"),
-			"stage_group_order": row.get("stageGroupOrder"),
-			"stage_subgroup_code": row.get("stageSubgroupCode"),
-			"stage_subgroup_label": row.get("stageSubgroupLabel"),
-			"stage_subgroup_order": row.get("stageSubgroupOrder"),
-			"nazwaPodmiotu": row["nazwaPodmiotu"],
-			"zakres_inspekcji": row.get("zakresInspekcji") or "-",
-			"zakres_inspekcji_items": row.get("zakresInspekcjiItems") or [],
-			"poczatekInspekcji": row.get("poczatekInspekcji") or "-",
-			"koniecInspekcji": row.get("koniecInspekcji") or "-",
-			"osobaKierujaca": row.get("osobaKierujaca", "-"),
-			"isLeaderCurrentUser": bool(row.get("isLeaderCurrentUser")),
-			"isMemberCurrentUser": bool(row.get("isMemberCurrentUser")),
-			"zespol": row["zespol"],
-			"zespolyInspekcji": row.get("zespolyInspekcji") or "-",
-			"inspectionTeamCodes": row.get("inspectionTeamCodes") or [],
-			"inspectionTeamIds": row.get("inspectionTeamIds") or [],
-			"data": row.get("data") or "-",
-			"czas": int(row["czas"]) if isinstance(row.get("czas"), (int, float)) else None,
-		}
-		for row in detail_source_rows
-	]
-
-	my_count_by_year_groups: dict[str, int] = defaultdict(int)
-	for row in rows_after_year:
-		if not (bool(row.get("isLeaderCurrentUser")) or bool(row.get("isMemberCurrentUser"))):
-			continue
-		year_key = str(row.get("rokPoczatku") or "").strip()
-		if not year_key:
-			continue
-		my_count_by_year_groups[year_key] += 1
-	my_count_by_year = {
-		year: int(my_count_by_year_groups[year])
-		for year in sorted(my_count_by_year_groups.keys())
-	}
-
-	my_count_by_year_breakdown_groups: dict[str, dict[str, int]] = defaultdict(
-		lambda: {"leader": 0, "member": 0, "combined": 0}
-	)
-	for row in rows_after_year:
-		year_key = str(row.get("rokPoczatku") or "").strip()
-		if not year_key:
-			continue
-		is_leader = bool(row.get("isLeaderCurrentUser"))
-		is_member = bool(row.get("isMemberCurrentUser"))
-		if not (is_leader or is_member):
-			continue
-		if is_leader:
-			my_count_by_year_breakdown_groups[year_key]["leader"] += 1
-		if is_member:
-			my_count_by_year_breakdown_groups[year_key]["member"] += 1
-		my_count_by_year_breakdown_groups[year_key]["combined"] += 1
-
-	my_count_by_year_breakdown = {
-		year: {
-			"leader": int(values["leader"]),
-			"member": int(values["member"]),
-			"combined": int(values["combined"]),
-		}
-		for year, values in sorted(my_count_by_year_breakdown_groups.items(), key=lambda item: item[0])
-	}
-
-	my_metric_by_year_leader_groups: dict[str, list[int]] = defaultdict(list)
-	my_metric_by_year_member_groups: dict[str, list[int]] = defaultdict(list)
-	my_metric_by_year_combined_groups: dict[str, list[int]] = defaultdict(list)
-	for row in rows_after_year:
-		if not _is_valid_for_aggregations(row):
-			continue
-		year_key = str(row.get("rokPoczatku") or "").strip()
-		if not year_key:
-			continue
-		czas_value = int(row["czas"])
-		is_leader = bool(row.get("isLeaderCurrentUser"))
-		is_member = bool(row.get("isMemberCurrentUser"))
-		if not (is_leader or is_member):
-			continue
-		if is_leader:
-			my_metric_by_year_leader_groups[year_key].append(czas_value)
-		if is_member:
-			my_metric_by_year_member_groups[year_key].append(czas_value)
-		my_metric_by_year_combined_groups[year_key].append(czas_value)
-
-	all_metric_years = sorted(
-		set(my_metric_by_year_leader_groups.keys())
-		| set(my_metric_by_year_member_groups.keys())
-		| set(my_metric_by_year_combined_groups.keys())
-	)
-	my_metric_by_year_breakdown: dict[str, dict[str, float]] = {}
-	for year in all_metric_years:
-		leader_metric = _metric_from_values(my_metric_by_year_leader_groups.get(year, []), trend_mode)
-		member_metric = _metric_from_values(my_metric_by_year_member_groups.get(year, []), trend_mode)
-		combined_metric = _metric_from_values(my_metric_by_year_combined_groups.get(year, []), trend_mode)
-		my_metric_by_year_breakdown[year] = {
-			"leader": float(leader_metric or 0),
-			"member": float(member_metric or 0),
-			"combined": float(combined_metric or 0),
-		}
-
-	my_count_all_years_breakdown = {
-		"leader": int(sum(values["leader"] for values in my_count_by_year_breakdown.values())),
-		"member": int(sum(values["member"] for values in my_count_by_year_breakdown.values())),
-		"combined": int(sum(values["combined"] for values in my_count_by_year_breakdown.values())),
-	}
-
-	my_metric_all_years_breakdown = {
-		"leader": float(
-			_metric_from_values([v for values in my_metric_by_year_leader_groups.values() for v in values], trend_mode) or 0
-		),
-		"member": float(
-			_metric_from_values([v for values in my_metric_by_year_member_groups.values() for v in values], trend_mode) or 0
-		),
-		"combined": float(
-			_metric_from_values([v for values in my_metric_by_year_combined_groups.values() for v in values], trend_mode) or 0
-		),
-	}
-
-	scatter_source_rows = list(agg_filtered_rows)
-	if is_personal_scope_mode:
-		scatter_source_rows = [
-			row
-			for row in scatter_source_rows
-			if bool(row.get("isLeaderCurrentUser")) or bool(row.get("isMemberCurrentUser"))
-		]
-
-	scatter_rows = [
-		{
-			"inspectionId": row["inspectionId"],
-			"year": int(row["rokPoczatku"]),
-			"time": float(row["czas"]),
-			"nazwaPodmiotu": row["nazwaPodmiotu"],
-			"kontrola": row["kodInspekcji"],
-			"osobaKierujaca": row.get("osobaKierujaca", "-"),
-			"zespol": row["zespol"],
-		}
-		for row in scatter_source_rows
-	]
-
-	status_counter: dict[tuple[int | None, str], int] = defaultdict(int)
-	piszemy_protokol_count = 0
-	piszemy_key = "piszemy protokol"
-	for row in all_type_base_rows:
-		status_id = row.get("statusInspekcjiId")
-		status_label_raw = str(row.get("statusInspekcji") or "-").strip()
-		status_label = status_label_raw if status_label_raw else "-"
-		status_counter[(status_id if isinstance(status_id, int) else None, status_label)] += 1
-		if _normalize_text_key(status_label) == piszemy_key:
-			piszemy_protokol_count += 1
-
-	alert_status_counts = [
-		{
-			"statusInspekcjiId": status_id,
-			"statusInspekcji": status_label,
-			"count": count,
-		}
-		for (status_id, status_label), count in sorted(
-			status_counter.items(),
-			key=lambda item: (-item[1], str(item[0][1]).lower()),
-		)
-	]
-
-	return {
-		"inspectionType": inspection_type,
-		"trendMode": trend_mode,
-		"selectedMetric": trend_mode,
-		"selectedMetricLabel": metric_label,
-		"baseCount": len(base_rows),
-		"filteredCount": len(filtered_rows),
-		"departmentMinTime": department_min_time,
-		"departmentMaxTime": department_max_time,
-		"departmentMinTimeByYear": department_min_time_by_year,
-		"departmentMaxTimeByYear": department_max_time_by_year,
-		"myCountByYear": my_count_by_year,
-		"myCountByYearBreakdown": my_count_by_year_breakdown,
-		"myMetricByYearBreakdown": my_metric_by_year_breakdown,
-		"myCountAllYearsBreakdown": my_count_all_years_breakdown,
-		"myMetricAllYearsBreakdown": my_metric_all_years_breakdown,
-		"teamOptions": team_options,
-		"yearOptions": year_options,
-		"detailRows": detail_rows,
-		"summaryColumns": [
-			{"key": "zespol", "label": "Zespol"},
-			{"key": "rok", "label": "Rok"},
-			{"key": "metric", "label": f"{metric_label} czasu"},
-			{"key": "average", "label": "Srednia"},
-			{"key": "median", "label": "Mediana"},
-			{"key": "count", "label": "Liczba"},
-		],
-		"summaryRows": summary_rows,
-		"summaryPivotYears": summary_pivot_years,
-		"summaryPivotRows": summary_pivot_rows,
-		"trendRows": trend_rows,
-		"scatterRows": scatter_rows,
-		"overallColumns": [
-			{"key": "zespol", "label": "Zespol"},
-			{"key": "metric", "label": f"{overall_metric_label}"},
-			{"key": "count", "label": "Liczba"},
-		],
-		"overallRows": overall_rows,
-		"yearCountColumns": year_count_columns,
-		"yearCountRows": year_count_rows,
-		"yearCountByTeamColumns": year_count_by_team_columns,
-		"yearCountByTeamRows": year_count_by_team_rows,
-		"alertStatusCounts": alert_status_counts,
-		"alertPiszemyProtokolCount": piszemy_protokol_count,
-	}
-
-
-@router.get("/api/reports/inspections-matrix", response_model=InspectionsMatrixResponse)
-def get_inspections_matrix(
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-	rodzaj_podmiotu: str | list[str] | None = Query(default=None, alias="rodzaj_podmiotu"),
-	rodzajPodmiotu: str | list[str] | None = Query(default=None),
-) -> dict[str, Any]:
-	raw_entity_type_filters = _parse_csv_values(rodzaj_podmiotu) + _parse_csv_values(rodzajPodmiotu)
-	entity_type_filter_keys = {_normalize_text_key(item) for item in raw_entity_type_filters if _normalize_text_key(item)}
-
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_REPORTS_EXECUTED_INSPECTIONS_READ)
-
-		rows = conn.execute(
-			"""
-			SELECT
-				i.id,
-				i.kod_inspekcji,
-				i.created_by_user_id,
-				COALESCE(ss.kod_pozycji, '') AS status_inspekcji_kod,
-				COALESCE(ss.nazwa_pozycji, '-') AS status_inspekcji,
-				COALESCE(NULLIF(trim(ss.skrot_pozycji), ''), ss.nazwa_pozycji, '-') AS status_inspekcji_skrot,
-				COALESCE(NULLIF(trim(np.skrot_pozycji), ''), np.nazwa_pozycji, '-') AS nazwa_podmiotu,
-				COALESCE(NULLIF(trim(rp.nazwa_pozycji), ''), '-') AS rodzaj_podmiotu,
-				ti.nazwa_pozycji AS typ_inspekcji,
-				(
-					SELECT group_concat(x.scope_name, '; ')
-					FROM (
-						SELECT COALESCE(NULLIF(trim(sp.skrot_pozycji), ''), sp.nazwa_pozycji, '-') AS scope_name
-						FROM inspection_scopes isc
-						JOIN slownik_pozycje sp ON sp.id = isc.scope_id
-						WHERE isc.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(sp.skrot_pozycji), ''), sp.nazwa_pozycji, '-')), sp.id
-					) x
-				) AS zakres_inspekcji,
-				i.poczatek_inspekcji AS poczatek_inspekcji,
-				i.koniec_inspekcji AS koniec_inspekcji,
-				u.zespol_id AS lead_team_id
-				,
-				(
-					SELECT group_concat(x.team_code, ',')
-					FROM (
-						SELECT DISTINCT COALESCE(NULLIF(trim(tt.kod), ''), '-') AS team_code
-						FROM inspection_teams it
-						JOIN teams tt ON tt.id = it.team_id
-						WHERE it.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(tt.kod), ''), '-')), tt.id
-					) x
-				) AS inspection_team_codes_csv
-				,
-				(
-					SELECT group_concat(x.team_id, ',')
-					FROM (
-						SELECT DISTINCT CAST(it.team_id AS TEXT) AS team_id
-						FROM inspection_teams it
-						WHERE it.inspection_id = i.id
-						ORDER BY it.team_id ASC
-					) x
-				) AS inspection_team_ids_csv
-			FROM inspections i
-			LEFT JOIN slownik_pozycje np ON np.id = i.nazwa_podmiotu_id
-			LEFT JOIN slownik_pozycje rp ON rp.id = i.rodzaj_podmiotu_id
-			LEFT JOIN slownik_pozycje ti ON ti.id = i.typ_inspekcji_id
-			LEFT JOIN slownik_pozycje ss ON ss.id = i.status_inspekcji_id
-			LEFT JOIN users u ON u.id = i.osoba_kierujaca_user_id
-			ORDER BY lower(np.nazwa_pozycji) ASC, i.poczatek_inspekcji ASC, i.id ASC
-			"""
-		).fetchall()
-
-	values_map: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-	entries_map: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-	entity_type_map: dict[str, list[str]] = defaultdict(list)
-	years_set: set[str] = set()
-
-	for row in rows:
-		row_data = dict(row)
-		if _is_reports_hidden_status_code(row_data.get("status_inspekcji_kod")):
-			continue
-		nazwa_podmiotu = str(row["nazwa_podmiotu"] or "-").strip() or "-"
-		resolved_entity_type = str(row["rodzaj_podmiotu"] or "-").strip() or "-"
-		if entity_type_filter_keys and _normalize_text_key(resolved_entity_type) not in entity_type_filter_keys:
-			continue
-		year = _year_from_date(row["poczatek_inspekcji"])
-		if year is None:
-			continue
-
-		years_set.add(year)
-		cell_value = _matrix_cell_value(row["typ_inspekcji"], row["zakres_inspekcji"])
-		values_map[nazwa_podmiotu][year].append(cell_value)
-		entries_map[nazwa_podmiotu][year].append(
-			{
-				"type": _matrix_type_code(row["typ_inspekcji"]),
-				"scopes": _normalize_matrix_scopes(row["zakres_inspekcji"]),
-				"inspectionId": int(row["id"]),
-				"kodInspekcji": str(row_data.get("kod_inspekcji") or "-").strip() or "-",
-				"date": str(row_data.get("poczatek_inspekcji") or "-").strip() or "-",
-				"startDate": str(row_data.get("poczatek_inspekcji") or "-").strip() or "-",
-				"endDate": str(row_data.get("koniec_inspekcji") or "-").strip() or "-",
-				"status": _public_status_label(row_data.get("status_inspekcji")),
-				"statusShort": str(row_data.get("status_inspekcji_skrot") or row_data.get("status_inspekcji") or "-").strip() or "-",
-			}
-		)
-		entity_type_map[nazwa_podmiotu].append(resolved_entity_type)
-
-	lata = sorted(years_set)
-	result_rows: list[dict[str, Any]] = []
-
-	for nazwa_podmiotu in sorted(values_map.keys(), key=lambda value: value.lower()):
-		wartosci: dict[str, str] = {}
-		cells: dict[str, list[dict[str, Any]]] = {}
-		for year in lata:
-			cell_values = values_map[nazwa_podmiotu].get(year, [])
-			entries = entries_map[nazwa_podmiotu].get(year, [])
-			cells[year] = sorted(
-				entries,
-				key=lambda item: (
-					str(item.get("date") or "9999-99-99"),
-					0 if str(item.get("type") or "") == "K" else 1,
-					int(item.get("inspectionId") or 0),
-				),
-			)
-			if not cell_values:
-				wartosci[year] = "-"
-				continue
-
-			# Keep insertion order while removing duplicates.
-			deduplicated = list(dict.fromkeys(cell_values))
-			if len(deduplicated) > 1:
-				deduplicated = [value for value in deduplicated if value != "-"]
-			wartosci[year] = ", ".join(deduplicated)
-
-		entity_types = list(dict.fromkeys(entity_type_map.get(nazwa_podmiotu, ["-"])))
-		if len(entity_types) > 1:
-			entity_types = [value for value in entity_types if value != "-"]
-		resolved_entity_types = ", ".join(entity_types) if entity_types else "-"
-
-		result_rows.append(
-			{
-				"nazwa_podmiotu": nazwa_podmiotu,
-				"rodzaj_podmiotu": resolved_entity_types,
-				"wartosci": wartosci,
-				"cells": cells,
-			}
-		)
-
-	return {
-		"formatVersion": "2.0",
-		"lata": lata,
-		"rows": result_rows,
-	}
-
-
-@router.get("/api/reports/inspections-detailed", response_model=InspectionsDetailedResponse)
-def get_inspections_detailed(
-	manager_user_id: int | None = Query(default=None, alias="managerUserId"),
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_REPORTS_EXECUTED_INSPECTIONS_READ)
-		if int(operator["rola_id"]) not in {1, 2, 3, 4}:
-			raise HTTPException(status_code=403, detail="Brak uprawnien")
-
-		manager_context: dict[str, Any] | None = None
-		if int(operator["rola_id"]) == 2:
-			manager_context = operator
-		elif int(operator["rola_id"]) == 3 and manager_user_id is not None:
-			manager_row = conn.execute(
-				"""
-				SELECT id, login, rola_id, zespol_id, aktywny
-				FROM users
-				WHERE id = ?
-				LIMIT 1
-				""",
-				(int(manager_user_id),),
-			).fetchone()
-			if manager_row is None:
-				raise HTTPException(status_code=404, detail="Kierownik nie istnieje")
-			manager_data = dict(manager_row)
-			if int(manager_data.get("aktywny") or 0) != 1:
-				raise HTTPException(status_code=400, detail="Kierownik jest nieaktywny")
-			if int(manager_data.get("rola_id") or 0) != 2:
-				raise HTTPException(status_code=400, detail="managerUserId musi wskazywac kierownika")
-			manager_context = {
-				"id": int(manager_data["id"]),
-				"login": manager_data["login"],
-				"rola_id": int(manager_data["rola_id"]),
-				"zespol_id": manager_data["zespol_id"],
-			}
-		elif manager_user_id is not None:
-			raise HTTPException(status_code=400, detail="managerUserId jest dozwolone tylko dla dyrektora")
-
-		rows = conn.execute(
-			"""
-			SELECT
-				i.id AS id,
-				i.created_by_user_id AS created_by_user_id,
-				i.osoba_kierujaca_user_id AS osoba_kierujaca_user_id,
-				i.kod_inspekcji AS kod_inspekcji,
-				i.status_inspekcji_id AS status_inspekcji_id,
-				COALESCE(si.kod_pozycji, '') AS status_inspekcji_kod,
-				COALESCE(si.nazwa_pozycji, '-') AS status_inspekcji,
-				COALESCE(NULLIF(trim(si.skrot_pozycji), ''), si.nazwa_pozycji, '-') AS status_inspekcji_skrot,
-				COALESCE(NULLIF(trim(np.skrot_pozycji), ''), np.nazwa_pozycji, '-') AS nazwa_podmiotu,
-				COALESCE(rp.nazwa_pozycji, '-') AS rodzaj_podmiotu,
-				ti.nazwa_pozycji AS typ_inspekcji,
-				(
-					SELECT group_concat(x.scope_name, '; ')
-					FROM (
-						SELECT COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-') AS scope_name
-						FROM inspection_scopes isc
-						JOIN slownik_pozycje sp ON sp.id = isc.scope_id
-						WHERE isc.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-')), sp.id
-					) x
-				) AS zakres_inspekcji,
-				(
-					SELECT group_concat(x.scope_id, ';')
-					FROM (
-						SELECT CAST(isc.scope_id AS TEXT) AS scope_id
-						FROM inspection_scopes isc
-						JOIN slownik_pozycje sp ON sp.id = isc.scope_id
-						WHERE isc.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(sp.nazwa_pozycji), ''), '-')), sp.id
-					) x
-				) AS zakres_inspekcji_ids_csv,
-				i.poczatek_inspekcji AS poczatek_inspekcji,
-				i.koniec_inspekcji AS koniec_inspekcji,
-				i.data_protokolu_sprawozdania AS data_protokolu_sprawozdania,
-				COALESCE(
-					nullif(trim(u.imie || ' ' || u.nazwisko), ''),
-					'-'
-				) AS osoba_kierujaca,
-				COALESCE(NULLIF(trim(t.kod), ''), '') AS zespol_osoby_kierujacej_kod,
-				u.zespol_id AS lead_team_id,
-				(
-					SELECT group_concat(x.team_code, ',')
-					FROM (
-						SELECT DISTINCT COALESCE(NULLIF(trim(tt.kod), ''), '') AS team_code
-						FROM inspection_teams it
-						JOIN teams tt ON tt.id = it.team_id
-						WHERE it.inspection_id = i.id
-						ORDER BY lower(COALESCE(NULLIF(trim(tt.kod), ''), '')), tt.id
-					) x
-				) AS inspection_team_codes_csv,
-				(
-					SELECT group_concat(x.team_id, ',')
-					FROM (
-						SELECT DISTINCT CAST(it.team_id AS TEXT) AS team_id
-						FROM inspection_teams it
-						WHERE it.inspection_id = i.id
-						ORDER BY it.team_id ASC
-					) x
-				) AS inspection_team_ids_csv
-			FROM inspections i
-			LEFT JOIN slownik_pozycje np ON np.id = i.nazwa_podmiotu_id
-			LEFT JOIN slownik_pozycje ti ON ti.id = i.typ_inspekcji_id
-			LEFT JOIN slownik_pozycje rp ON rp.id = i.rodzaj_podmiotu_id
-			LEFT JOIN slownik_pozycje si ON si.id = i.status_inspekcji_id
-			LEFT JOIN users u ON u.id = i.osoba_kierujaca_user_id
-			LEFT JOIN teams t ON t.id = u.zespol_id
-			ORDER BY lower(np.nazwa_pozycji) ASC, i.poczatek_inspekcji ASC, i.id ASC
-			"""
-		).fetchall()
-
-	result_rows: list[dict[str, Any]] = []
-	scope_name_cache: dict[int, str] = {}
-	for row in rows:
-		if _is_dashboard_hidden_status_code(row["status_inspekcji_kod"]):
-			continue
-		if manager_context is not None:
-			in_team_scope, in_added_scope = _manager_scope_flags_for_inspection(conn, int(row["id"]), manager_context)
-			if not (in_team_scope or in_added_scope):
-				continue
-		else:
-			if int(operator["rola_id"]) != 3 and not _can_access_inspection_for_reports(conn, dict(row), operator):
-				continue
-		poczatek_inspekcji = str(row["poczatek_inspekcji"] or "-")
-		koniec_inspekcji = str(row["koniec_inspekcji"] or "-")
-		data_protokolu = row["data_protokolu_sprawozdania"]
-		end_to_today_days = _days_from_end_to_today(row["koniec_inspekcji"])
-		status_label = _public_status_label(row["status_inspekcji"])
-		bucket_value = _end_to_today_bucket(end_to_today_days) if _should_compute_bucket_code(row["status_inspekcji_kod"]) else None
-		bucket_value_alt = _end_to_today_bucket_alt(end_to_today_days) if _should_compute_bucket_code(row["status_inspekcji_kod"]) else None
-		inspection_id = int(row["id"])
-		zakres_inspekcji_raw = str(row["zakres_inspekcji"] or "-").strip() or "-"
-		zakres_inspekcji_items = _scope_items_from_ids_csv(conn, row["zakres_inspekcji_ids_csv"], scope_name_cache)
-		leader_user_id = int(row["osoba_kierujaca_user_id"]) if row["osoba_kierujaca_user_id"] is not None else None
-		is_leader_current_user = leader_user_id is not None and int(operator["id"]) == leader_user_id
-		is_member_current_user = _is_member_current_user(conn, inspection_id, int(operator["id"]))
-		inspection_team_codes = [
-			value.strip()
-			for value in str(row["inspection_team_codes_csv"] or "").split(",")
-			if value.strip()
-		]
-		inspection_team_ids = _parse_int_csv_values(row["inspection_team_ids_csv"])
-		leader_team_code = str(row["zespol_osoby_kierujacej_kod"] or "").strip()
-		teams_display = "; ".join(inspection_team_codes) if inspection_team_codes else ""
-		scope_operator = manager_context if manager_context is not None else operator
-		is_leader_in_manager_team = _is_leader_in_manager_scope(conn, leader_user_id, scope_operator)
-		is_member_in_manager_team = _is_member_in_manager_scope(conn, inspection_id, scope_operator)
-
-		result_rows.append(
-			{
-				"kod_inspekcji": str(row["kod_inspekcji"] or "-").strip() or "-",
-				"nazwa_podmiotu": str(row["nazwa_podmiotu"] or "-").strip() or "-",
-				"nazwa_podmiotu_skrocona": str(row["nazwa_podmiotu"] or "-").strip() or "-",
-				"nazwa_podmiotu_skrot": str(row["nazwa_podmiotu"] or "-").strip() or "-",
-				"nazwaPodmiotuSkrocona": str(row["nazwa_podmiotu"] or "-").strip() or "-",
-				"nazwaPodmiotuSkrot": str(row["nazwa_podmiotu"] or "-").strip() or "-",
-				"rodzaj_podmiotu": str(row["rodzaj_podmiotu"] or "-").strip() or "-",
-				"inspekcja": _inspekcja_code(row["typ_inspekcji"]),
-				"typ_inspekcji": str(row["typ_inspekcji"] or "-").strip() or "-",
-				"status": status_label,
-				"status_inspekcji_skrot": str(row["status_inspekcji_skrot"] or status_label or "-").strip() or "-",
-				"status_inspekcji_id": int(row["status_inspekcji_id"]) if row["status_inspekcji_id"] is not None else None,
-				"status_inspekcji": status_label,
-				"zakres_inspekcji": zakres_inspekcji_raw,
-				"zakres_inspekcji_items": zakres_inspekcji_items,
-				"typ_zakres_inspekcji": _matrix_cell_value(row["typ_inspekcji"], row["zakres_inspekcji"]),
-				"rok_poczatku": _year_from_date(row["poczatek_inspekcji"]) or "-",
-				"poczatek_inspekcji": poczatek_inspekcji,
-				"koniec_inspekcji": koniec_inspekcji,
-				"inspektor_kierujacy": str(row["osoba_kierujaca"] or "-").strip() or "-",
-				"is_leader_current_user": bool(is_leader_current_user),
-				"is_leader_in_manager_team": bool(is_leader_in_manager_team),
-				"is_member_current_user": bool(is_member_current_user),
-				"is_member_in_manager_team": bool(is_member_in_manager_team),
-				"liczba_dni_od_konca_inspekcji_do_dzis": end_to_today_days,
-				"wartosc_liczbowa_przedzialu": bucket_value,
-				"wartosc_liczbowa_przedzialu_alt": bucket_value_alt,
-				"osoba_kierujaca": str(row["osoba_kierujaca"] or "-").strip() or "-",
-				"zespol_osoby_kierujacej_kod": leader_team_code,
-				"zespol": leader_team_code,
-				"zespolyInspekcji": teams_display,
-				"zespoly": teams_display,
-				"inspection_team_codes": inspection_team_codes,
-				"inspectionTeamCodes": inspection_team_codes,
-				"inspection_team_ids": inspection_team_ids,
-				"inspectionTeamIds": inspection_team_ids,
-				"data_protokolu_sprawozdania": data_protokolu,
-				"roznica_dni_miedzy_data_protokolu_a_koncem": _days_difference(data_protokolu, row["koniec_inspekcji"]),
-			}
-		)
-
-	return {
-		"rows": result_rows,
-	}
-
-
-@router.get("/api/reports/inspections-stage-summary", response_model=InspectionsStageSummaryResponse)
-def get_inspections_stage_summary(
-	manager_user_id: int | None = Query(default=None, alias="managerUserId"),
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_REPORTS_EXECUTED_INSPECTIONS_READ)
-		if int(operator["rola_id"]) not in {1, 2, 3, 4}:
-			raise HTTPException(status_code=403, detail="Brak uprawnien")
-
-		manager_context: dict[str, Any] | None = None
-		if int(operator["rola_id"]) == 2:
-			manager_context = operator
-		elif int(operator["rola_id"]) == 3 and manager_user_id is not None:
-			manager_row = conn.execute(
-				"""
-				SELECT id, login, rola_id, zespol_id, aktywny
-				FROM users
-				WHERE id = ?
-				LIMIT 1
-				""",
-				(int(manager_user_id),),
-			).fetchone()
-			if manager_row is None:
-				raise HTTPException(status_code=404, detail="Kierownik nie istnieje")
-			manager_data = dict(manager_row)
-			if int(manager_data.get("aktywny") or 0) != 1:
-				raise HTTPException(status_code=400, detail="Kierownik jest nieaktywny")
-			if int(manager_data.get("rola_id") or 0) != 2:
-				raise HTTPException(status_code=400, detail="managerUserId musi wskazywac kierownika")
-			manager_context = {
-				"id": int(manager_data["id"]),
-				"login": manager_data["login"],
-				"rola_id": int(manager_data["rola_id"]),
-				"zespol_id": manager_data["zespol_id"],
-			}
-		elif manager_user_id is not None:
-			raise HTTPException(status_code=400, detail="managerUserId jest dozwolone tylko dla dyrektora")
-
-		status_rows = conn.execute(
-			"""
-			SELECT
-				id,
-				COALESCE(NULLIF(trim(kod_pozycji), ''), '') AS kod_pozycji,
-				COALESCE(nazwa_pozycji, 'brak') AS nazwa_pozycji,
-				COALESCE(kolejnosc, 999999) AS kolejnosc
-			FROM slownik_pozycje
-			WHERE lower(kod_typu) = 'statusy_inspekcji'
-			ORDER BY COALESCE(kolejnosc, 999999) ASC, id ASC
-			"""
-		).fetchall()
-
-		status_stats: dict[str, dict[str, Any]] = {}
-		status_id_index: dict[int, str] = {}
-		for status_row in status_rows:
-			if _is_dashboard_hidden_status_code(status_row["kod_pozycji"]):
-				continue
-			status_id = int(status_row["id"])
-			status_name = str(status_row["nazwa_pozycji"] or "").strip() or f"status_{status_id}"
-			status_code = _normalize_code_key(status_name) or f"status_{status_id}"
-			stage_group_order = _dashboard_status_display_order(
-				status_row["kod_pozycji"],
-				int(status_row["kolejnosc"]),
-			)
-			status_stats[status_code] = {
-				"statusId": status_id,
-				"stageGroupCode": status_code,
-				"stageGroupLabel": status_name,
-				"stageGroupShortLabel": status_name,
-				"stageGroupOrder": int(stage_group_order),
-				"count": 0,
-				"countTeam": 0,
-				"countManagerAdded": 0,
-				"countTeamAndManagerAdded": 0,
-			}
-			status_id_index[status_id] = status_code
-
-		unknown_code = "unknown_unmapped"
-		if unknown_code not in status_stats:
-			status_stats[unknown_code] = {
-				"statusId": None,
-				"stageGroupCode": unknown_code,
-				"stageGroupLabel": "Nieprzypisany status",
-				"stageGroupShortLabel": "Nieprzypisany status",
-				"stageGroupOrder": 999999,
-				"count": 0,
-				"countTeam": 0,
-				"countManagerAdded": 0,
-				"countTeamAndManagerAdded": 0,
-			}
-
-		rows = conn.execute(
-			"""
-			SELECT
-				i.id,
-				i.created_by_user_id,
-				i.status_inspekcji_id,
-				COALESCE(si.kod_pozycji, '') AS status_inspekcji_kod
-			FROM inspections i
-			LEFT JOIN slownik_pozycje si ON si.id = i.status_inspekcji_id
-			ORDER BY i.id ASC
-			"""
-		).fetchall()
-
-		total_inspections = 0
-		quality_error_count = 0
-
-		for row in rows:
-			row_dict = dict(row)
-			inspection_id = int(row_dict["id"])
-			in_team_scope = False
-			in_added_scope = False
-
-			if _is_dashboard_hidden_status_code(row_dict.get("status_inspekcji_kod")):
-				continue
-
-			if manager_context is not None:
-				in_team_scope, in_added_scope = _manager_scope_flags_for_inspection(conn, inspection_id, manager_context)
-				if not (in_team_scope or in_added_scope):
-					continue
-			else:
-				if int(operator["rola_id"]) != 3 and not _can_access_inspection_for_reports(conn, row_dict, operator):
-					continue
-
-			status_id = row_dict.get("status_inspekcji_id")
-			group_code = unknown_code
-			if status_id is not None:
-				group_code = status_id_index.get(int(status_id), unknown_code)
-
-			if group_code == unknown_code:
-				quality_error_count += 1
-
-			total_inspections += 1
-			group_item = status_stats[group_code]
-
-			group_item["count"] += 1
-
-			if manager_context is not None:
-				if in_team_scope:
-					group_item["countTeam"] += 1
-				if in_added_scope:
-					group_item["countManagerAdded"] += 1
-				if in_team_scope and in_added_scope:
-					group_item["countTeamAndManagerAdded"] += 1
-
-		statuses_payload = [
-			{
-				"stageGroupCode": item["stageGroupCode"],
-				"stageGroupLabel": item["stageGroupLabel"],
-				"stageGroupShortLabel": item.get("stageGroupShortLabel"),
-				"stageGroupOrder": item["stageGroupOrder"],
-				"count": item["count"],
-				"countTeam": item["countTeam"],
-				"countManagerAdded": item["countManagerAdded"],
-				"countTeamAndManagerAdded": item["countTeamAndManagerAdded"],
-			}
-			for item in sorted(status_stats.values(), key=lambda x: (int(x["stageGroupOrder"]), str(x["stageGroupLabel"]).lower()))
-		]
-
-	return {
-		"generatedAt": datetime.now().isoformat(timespec="seconds"),
-		"stageDictionaryVersion": "2.0.0",
-		"totalInspections": int(total_inspections),
-		"qualityErrorCount": int(quality_error_count),
-		"statuses": statuses_payload,
-	}
-
-
-@router.get("/api/reports/recommendations-stage-summary", response_model=RecommendationsStageSummaryResponse)
-def get_recommendations_stage_summary(
-	manager_user_id: int | None = Query(default=None, alias="managerUserId"),
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_RECOMMENDATIONS_READ)
-		if int(operator["rola_id"]) not in {1, 2, 3, 4}:
-			raise HTTPException(status_code=403, detail="Brak uprawnien")
-
-		manager_context: dict[str, Any] | None = None
-		if int(operator["rola_id"]) == 2:
-			manager_context = operator
-		elif int(operator["rola_id"]) == 3 and manager_user_id is not None:
-			manager_row = conn.execute(
-				"""
-				SELECT id, login, rola_id, zespol_id, aktywny
-				FROM users
-				WHERE id = ?
-				LIMIT 1
-				""",
-				(int(manager_user_id),),
-			).fetchone()
-			if manager_row is None:
-				raise HTTPException(status_code=404, detail="Kierownik nie istnieje")
-			manager_data = dict(manager_row)
-			if int(manager_data.get("aktywny") or 0) != 1:
-				raise HTTPException(status_code=400, detail="Kierownik jest nieaktywny")
-			if int(manager_data.get("rola_id") or 0) != 2:
-				raise HTTPException(status_code=400, detail="managerUserId musi wskazywac kierownika")
-			manager_context = {
-				"id": int(manager_data["id"]),
-				"login": manager_data["login"],
-				"rola_id": int(manager_data["rola_id"]),
-				"zespol_id": manager_data["zespol_id"],
-			}
-		elif manager_user_id is not None:
-			raise HTTPException(status_code=400, detail="managerUserId jest dozwolone tylko dla dyrektora")
-
-		manager_team_recommendation_ids: set[int] = set()
-		if manager_context is not None:
-			manager_team_recommendation_ids = _recommendation_ids_for_manager_team(conn, manager_context)
-
-		status_rows = conn.execute(
-			"""
-			SELECT
-				id,
-				COALESCE(kod_pozycji, '') AS kod_pozycji,
-				COALESCE(nazwa_pozycji, 'brak') AS nazwa_pozycji,
-				COALESCE(kolejnosc, 999999) AS kolejnosc
-			FROM slownik_pozycje
-			WHERE lower(kod_typu) = 'statusy_zalecen'
-			ORDER BY COALESCE(kolejnosc, 999999) ASC, id ASC
-			"""
-		).fetchall()
-
-		group_stats: dict[str, dict[str, Any]] = {}
-		status_id_to_code: dict[int, str] = {}
-		for status_row in status_rows:
-			status_id = int(status_row["id"])
-			status_code = str(status_row["kod_pozycji"] or "").strip() or f"status_{status_id}"
-			group_stats[status_code] = {
-				"statusId": status_id,
-				"stageGroupCode": status_code,
-				"stageGroupLabel": str(status_row["nazwa_pozycji"]),
-				"stageGroupShortLabel": status_row["nazwa_pozycji"],
-				"stageGroupOrder": int(status_row["kolejnosc"]),
-				"count": 0,
-				"countTeam": 0,
-				"countManagerAdded": 0,
-				"countTeamAndManagerAdded": 0,
-			}
-			status_id_to_code[status_id] = status_code
-
-		unknown_code = "unknown_unmapped"
-		if unknown_code not in group_stats:
-			group_stats[unknown_code] = {
-				"statusId": None,
-				"stageGroupCode": unknown_code,
-				"stageGroupLabel": "Nieprzypisany status",
-				"stageGroupShortLabel": "Nieprzypisany status",
-				"stageGroupOrder": 999999,
-				"count": 0,
-				"countTeam": 0,
-				"countManagerAdded": 0,
-				"countTeamAndManagerAdded": 0,
-			}
-
-		recommendation_rows = conn.execute(
-			"""
-			SELECT
-				r.id,
-				r.inspection_id,
-				r.created_by_user_id AS recommendation_created_by_user_id,
-				r.status_zalecenia_id,
-				i.created_by_user_id AS inspection_created_by_user_id,
-				ru.zespol_id AS recommendation_author_team_id,
-				ru.created_by_user_id AS recommendation_author_created_by_user_id
-			FROM recommendations r
-			LEFT JOIN inspections i ON i.id = r.inspection_id
-			LEFT JOIN users ru ON ru.id = r.created_by_user_id
-			ORDER BY r.id ASC
-			"""
-		).fetchall()
-
-		total_recommendations = 0
-		quality_error_count = 0
-
-		for row in recommendation_rows:
-			row_dict = dict(row)
-
-			status_id = row_dict.get("status_zalecenia_id")
-			if status_id is not None:
-				status_code = status_id_to_code.get(int(status_id))
-				if _is_dashboard_hidden_recommendation_status_code(status_code):
-					continue
-
-			in_team_scope = False
-			in_added_scope = False
-
-			if manager_context is not None:
-				recommendation_id_raw = row_dict.get("id")
-				if recommendation_id_raw is None:
-					continue
-				in_team_scope = int(recommendation_id_raw) in manager_team_recommendation_ids
-				if not in_team_scope:
-					continue
-			else:
-				if not _can_access_recommendation_for_reports(conn, row_dict, operator):
-					continue
-
-			group_code = unknown_code
-			if status_id is not None:
-				for code, payload in group_stats.items():
-					if payload.get("statusId") is not None and int(payload["statusId"]) == int(status_id):
-						group_code = code
-						break
-
-			if group_code == unknown_code:
-				quality_error_count += 1
-
-			total_recommendations += 1
-			group_item = group_stats[group_code]
-			group_item["count"] += 1
-
-			if manager_context is not None:
-				if in_team_scope:
-					group_item["countTeam"] += 1
-				if in_added_scope:
-					group_item["countManagerAdded"] += 1
-				if in_team_scope and in_added_scope:
-					group_item["countTeamAndManagerAdded"] += 1
-
-		groups_payload = [
-			{
-				"stageGroupCode": item["stageGroupCode"],
-				"stageGroupLabel": item["stageGroupLabel"],
-				"stageGroupShortLabel": item.get("stageGroupShortLabel"),
-				"stageGroupOrder": item["stageGroupOrder"],
-				"count": item["count"],
-				"countTeam": item["countTeam"],
-				"countManagerAdded": item["countManagerAdded"],
-				"countTeamAndManagerAdded": item["countTeamAndManagerAdded"],
-			}
-			for item in sorted(group_stats.values(), key=lambda x: (int(x["stageGroupOrder"]), str(x["stageGroupCode"])))
-		]
-
-	return {
-		"generatedAt": datetime.now().isoformat(timespec="seconds"),
-		"stageDictionaryVersion": RECOMMENDATIONS_STAGE_DICTIONARY_VERSION,
-		"totalRecommendations": int(total_recommendations),
-		"qualityErrorCount": int(quality_error_count),
-		"groups": groups_payload,
-	}
-
-
-@router.get("/api/reports/recommendations-detailed", response_model=RecommendationsDetailedResponse)
-def get_recommendations_detailed(
-	manager_user_id: int | None = Query(default=None, alias="managerUserId"),
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		require_permission(conn, operator, PERMISSION_RECOMMENDATIONS_READ)
-		if int(operator["rola_id"]) not in {1, 2, 3, 4}:
-			raise HTTPException(status_code=403, detail="Brak uprawnien")
-
-		manager_context: dict[str, Any] | None = None
-		if int(operator["rola_id"]) == 2:
-			manager_context = operator
-		elif int(operator["rola_id"]) == 3 and manager_user_id is not None:
-			manager_row = conn.execute(
-				"""
-				SELECT id, login, rola_id, zespol_id, aktywny
-				FROM users
-				WHERE id = ?
-				LIMIT 1
-				""",
-				(int(manager_user_id),),
-			).fetchone()
-			if manager_row is None:
-				raise HTTPException(status_code=404, detail="Kierownik nie istnieje")
-			manager_data = dict(manager_row)
-			if int(manager_data.get("aktywny") or 0) != 1:
-				raise HTTPException(status_code=400, detail="Kierownik jest nieaktywny")
-			if int(manager_data.get("rola_id") or 0) != 2:
-				raise HTTPException(status_code=400, detail="managerUserId musi wskazywac kierownika")
-			manager_context = {
-				"id": int(manager_data["id"]),
-				"login": manager_data["login"],
-				"rola_id": int(manager_data["rola_id"]),
-				"zespol_id": manager_data["zespol_id"],
-			}
-		elif manager_user_id is not None:
-			raise HTTPException(status_code=400, detail="managerUserId jest dozwolone tylko dla dyrektora")
-
-		manager_team_recommendation_ids: set[int] = set()
-		if manager_context is not None:
-			manager_team_recommendation_ids = _recommendation_ids_for_manager_team(conn, manager_context)
-
-		rows = conn.execute(
-			"""
-			SELECT
-				r.id,
-				r.kod_zalecenia,
-				r.inspection_id,
-				i.kod_inspekcji,
-				r.created_by_user_id AS recommendation_created_by_user_id,
-				r.status_zalecenia_id,
-				COALESCE(st.kod_pozycji, '') AS status_kod,
-				r.data_zalecen,
-				COALESCE(st.nazwa_pozycji, 'brak') AS status_nazwa,
-				COALESCE(NULLIF(trim(st.skrot_pozycji), ''), st.nazwa_pozycji, 'brak') AS status_skrot,
-				COALESCE(
-					NULLIF(trim(np_rec.skrot_pozycji), ''),
-					np_rec.nazwa_pozycji,
-					NULLIF(trim(np_ins.skrot_pozycji), ''),
-					np_ins.nazwa_pozycji,
-					'brak'
-				) AS nazwa_podmiotu,
-				i.created_by_user_id AS inspection_created_by_user_id,
-				ru.zespol_id AS recommendation_author_team_id,
-				ru.created_by_user_id AS recommendation_author_created_by_user_id,
-				COALESCE(NULLIF(trim(tlead.kod), ''), '') AS inspection_leader_team_code,
-				(
-					SELECT group_concat(x.dv, ',')
-					FROM (
-						SELECT rmd.date_value AS dv
-						FROM recommendation_multi_dates rmd
-						WHERE rmd.recommendation_id = r.id
-							AND rmd.date_type = 'TERMIN_WYKONANIA_ZALECEN'
-						ORDER BY rmd.date_value ASC
-					) x
-				) AS terminy_wykonania_csv,
-				(
-					SELECT group_concat(x.team_code, ',')
-					FROM (
-						SELECT DISTINCT COALESCE(NULLIF(trim(tt.kod), ''), '') AS team_code
-						FROM recommendation_teams rt
-						JOIN teams tt ON tt.id = rt.team_id
-						WHERE rt.recommendation_id = r.id
-						ORDER BY lower(COALESCE(NULLIF(trim(tt.kod), ''), '')), tt.id
-					) x
-				) AS inspection_team_codes_csv,
-				(
-					SELECT group_concat(x.team_id, ',')
-					FROM (
-						SELECT DISTINCT CAST(rt.team_id AS TEXT) AS team_id
-						FROM recommendation_teams rt
-						WHERE rt.recommendation_id = r.id
-						ORDER BY rt.team_id ASC
-					) x
-				) AS inspection_team_ids_csv,
-				COALESCE(r.pozycja, 0) AS liczba_zalecen
-			FROM recommendations r
-			LEFT JOIN inspections i ON i.id = r.inspection_id
-			LEFT JOIN users ru ON ru.id = r.created_by_user_id
-			LEFT JOIN users ulead ON ulead.id = i.osoba_kierujaca_user_id
-			LEFT JOIN teams tlead ON tlead.id = ulead.zespol_id
-			LEFT JOIN slownik_pozycje st ON st.id = r.status_zalecenia_id
-			LEFT JOIN slownik_pozycje np_rec ON np_rec.id = r.nazwa_podmiotu_id
-			LEFT JOIN slownik_pozycje np_ins ON np_ins.id = i.nazwa_podmiotu_id
-			ORDER BY r.id DESC
-			"""
-		).fetchall()
-
-		def _first_deadline(csv_value: str | None) -> str | None:
-			if csv_value is None:
-				return None
-			parts = [p.strip() for p in str(csv_value).split(",") if p.strip()]
-			if not parts:
-				return None
-			return parts[0]
-
-		payload_rows: list[dict[str, Any]] = []
-		for row in rows:
-			row_dict = dict(row)
-			if _is_dashboard_hidden_recommendation_status_code(row_dict.get("status_kod")):
-				continue
-
-			in_team_scope = False
-			in_added_scope = False
-
-			if manager_context is not None:
-				recommendation_id_raw = row_dict.get("id")
-				if recommendation_id_raw is None:
-					continue
-				in_team_scope = int(recommendation_id_raw) in manager_team_recommendation_ids
-				if not in_team_scope:
-					continue
-			else:
-				if not _can_access_recommendation_for_reports(conn, row_dict, operator):
-					continue
-
-			terminy_csv = row_dict.get("terminy_wykonania_csv")
-			inspection_team_codes = [
-				value.strip()
-				for value in str(row_dict.get("inspection_team_codes_csv") or "").split(",")
-				if value.strip()
-			]
-			inspection_team_ids = _parse_int_csv_values(row_dict.get("inspection_team_ids_csv"))
-			leader_team_code = str(row_dict.get("inspection_leader_team_code") or "").strip()
-			teams_display = "; ".join(inspection_team_codes) if inspection_team_codes else ""
-			payload_rows.append(
-				{
-					"status": str(row_dict.get("status_nazwa") or "brak"),
-					"status_skrot": str(row_dict.get("status_skrot") or row_dict.get("status_nazwa") or "brak"),
-					"statusSkrot": str(row_dict.get("status_skrot") or row_dict.get("status_nazwa") or "brak"),
-					"kod_zalecenia": row_dict.get("kod_zalecenia"),
-					"kod_inspekcji": row_dict.get("kod_inspekcji"),
-					"kodZalecenia": row_dict.get("kod_zalecenia"),
-					"kodInspekcji": row_dict.get("kod_inspekcji"),
-					"nazwa_podmiotu": str(row_dict.get("nazwa_podmiotu") or "brak"),
-					"nazwa_podmiotu_skrocona": str(row_dict.get("nazwa_podmiotu") or "brak"),
-					"nazwa_podmiotu_skrot": str(row_dict.get("nazwa_podmiotu") or "brak"),
-					"nazwaPodmiotuSkrocona": str(row_dict.get("nazwa_podmiotu") or "brak"),
-					"nazwaPodmiotuSkrot": str(row_dict.get("nazwa_podmiotu") or "brak"),
-					"data_zalecen": row_dict.get("data_zalecen"),
-					"termin_zalecen": _first_deadline(terminy_csv),
-					"termin_wykonania_zalecen": terminy_csv,
-					"zespol": leader_team_code,
-					"zespolyInspekcji": teams_display,
-					"zespoly": teams_display,
-					"inspection_team_codes": inspection_team_codes,
-					"inspectionTeamCodes": inspection_team_codes,
-					"inspection_team_ids": inspection_team_ids,
-					"inspectionTeamIds": inspection_team_ids,
-					"liczba_zalecen": int(row_dict.get("liczba_zalecen") or 0),
-				}
-			)
-
-	return {"rows": payload_rows}
-
-
-@router.get("/api/reports/export")
-def download_report_export(
-	reportType: ReportExportType = Query(...),
-	manager_user_id: int | None = Query(default=None, alias="managerUserId"),
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> StreamingResponse:
-	filename, content = _report_export_payload(
-		reportType,
-		x_operator_login=x_operator_login,
-		manager_user_id=manager_user_id,
-	)
-	headers = {
-		"Content-Disposition": f'attachment; filename="{filename}"',
-	}
-	return StreamingResponse(io.BytesIO(content), media_type="text/csv; charset=utf-8", headers=headers)
-
-
-@router.post("/api/reports/send-email", response_model=ReportExportEmailResponse)
-def send_report_export_email(
-	payload: ReportExportEmailRequest,
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	if not payload.toEmails:
-		raise HTTPException(status_code=422, detail="toEmails jest wymagane")
-
-	recipients = _normalize_emails(payload.toEmails)
-	if not recipients:
-		raise HTTPException(status_code=422, detail="Brak poprawnych adresow email")
-
-	report_types = list(dict.fromkeys(payload.reportTypes or []))
-	if not report_types:
-		raise HTTPException(status_code=422, detail="reportTypes jest wymagane")
-
-	attachments: list[tuple[str, bytes]] = []
-	for report_type in report_types:
-		filename, content = _report_export_payload(
-			report_type,
-			x_operator_login=x_operator_login,
-			manager_user_id=payload.managerUserId,
-		)
-		attachments.append((filename, content))
-
-	subject = (payload.subject or "Raport - Inspekcje/Zalecenia").strip() or "Raport - Inspekcje/Zalecenia"
-	body = (
-		(payload.body or "W zalaczeniu raport CSV wygenerowany z systemu.").strip()
-		or "W zalaczeniu raport CSV wygenerowany z systemu."
-	)
-
-	for email in recipients:
-		_send_email_with_attachments(
-			to_email=email,
-			subject=subject,
-			body=body,
-			attachments=attachments,
-		)
-
-	return {
-		"sentCount": len(recipients),
-		"attachmentNames": [name for name, _ in attachments],
-	}
-
-
-@router.post("/api/reports/send-html", response_model=DashboardSendHtmlResponse)
-def send_dashboard_html_email(
-	payload: DashboardSendHtmlRequest,
-	x_operator_login: str = Header(..., alias="X-Operator-Login"),
-) -> dict[str, Any]:
-	requested_format = _resolve_dashboard_file_format(payload)
-	if requested_format != "pdf":
-		raise HTTPException(
-			status_code=422,
-			detail={
-				"code": "REPORTS_SEND_PDF_ONLY",
-				"message": "Endpoint /api/reports/send-html przyjmuje teraz tylko PDF",
-			},
-		)
-	file_name = _sanitize_dashboard_filename(payload.fileName, "pdf")
-	pdf_bytes = _decode_pdf_base64(payload.pdfBase64 or "")
-
-	with get_connection() as conn:
-		operator = _resolve_operator(conn, x_operator_login)
-		recipient_email, _recipient_name = _resolve_dashboard_recipient(conn, int(operator["id"]))
-
-	date_text = _dashboard_subject_date(payload.meta.generatedAt if payload.meta else None)
-	subject = f"Przesłanie dashboardu ({date_text})"
-	body = "W załączeniu przesyłamy zrzut dashboardu dotyczącego inspekcji oraz zaleceń, w formacie PDF."
-	attachment = (file_name, pdf_bytes, "application/pdf")
-
-	_send_email_with_typed_attachments(
-		to_email=recipient_email,
-		subject=subject,
-		body=body,
-		attachments=[attachment],
-	)
-
-	return {
-		"message": "Wyslano PDF na email zalogowanego uzytkownika",
-		"recipientEmail": recipient_email,
-		"fileName": file_name,
-		"fileFormat": "pdf",
-	}
+
+from typing import Iterable, Sequence
+import time
+
+import numpy as np
+import pandas as pd
+from numba import njit, prange
+
+### do CL
+
+# ---------------------------------------------------------------------------
+# Helper functions (Numba‑accelerated)
+# ---------------------------------------------------------------------------
+@njit
+def vector_reverse_diagonal(data: np.ndarray):
+    """Zwraca wektor elementów odwrotnej przekątnej (ostatniej pełnej diagonali)."""
+    rows, cols = data.shape
+    result = []
+    for i in range(rows):
+        j = cols - 1 - i
+        if 0 <= j < cols:
+            v = data[i, j]
+            if not np.isnan(v):
+                result.append(v)
+    return np.array(result)
+
+@njit
+def sum_reverse_diagonal(data: np.ndarray) -> float:
+    """Suma odwrotnej przekątnej (ostatniej pełnej diagonali)."""
+    tot = 0.0
+    rows, cols = data.shape
+    for i in range(rows):
+        j = cols - 1 - i
+        if 0 <= j < cols:
+            v = data[i, j]
+            if not np.isnan(v):
+                tot += v
+    return tot
+
+
+@njit
+def Dev_prem(data_paid: np.ndarray, wagi: np.ndarray) -> np.ndarray:
+    n_row, n_col = data_paid.shape
+    dev = np.empty(n_col - 1)
+    for j in range(n_col - 1):
+        num = den = 0.0
+        for i in range(n_row):
+            val_curr = data_paid[i, j]
+            val_next = data_paid[i, j + 1]
+            w = wagi[i, j]
+            if not (np.isnan(val_next)):
+                num += val_next * w
+                den += val_curr * w
+        dev[j] = num / den if den != 0.0 else 1.0
+    return dev
+
+
+@njit
+def elementwise_division(data_paid: np.ndarray) -> np.ndarray:
+
+    n_rows, n_cols = data_paid.shape
+    out = np.empty((n_rows, n_cols - 1))
+    for i in range(n_rows):
+        for j in range(n_cols - 1):
+            a = data_paid[i, j]
+            b = data_paid[i, j + 1]
+            if a != 0.0 and not np.isnan(b):
+                val = b / a
+                out[i, j] = val if np.isfinite(val) else 1.0
+            else:
+                out[i, j] = 1.0
+    return out
+
+@njit
+def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
+    n_rows, n_cols = l_ij.shape
+    sigmas = []
+    sds = []
+    
+    for j in range(n_cols):
+        dev = dev_j[j]
+        num = den = den_sd = 0.0
+        
+        for i in range(n_rows):
+            w = w_ij[i, j]
+            p = p_ij[i, j]
+            l = l_ij[i, j]
+            
+            # Sprawdź czy wszystkie wartości są prawidłowe (nie NaN)
+            if not (np.isnan(w) or np.isnan(p) or np.isnan(l)):
+                diff = l - dev
+                num += w * p * diff * diff
+                den += w
+                den_sd += w * p
+        
+        # Oblicz sigma zgodnie z oryginalną logiką
+        if den > 1:
+            sigma = num / (den - 1.0)
+            sd_val = sigma / den_sd if den_sd > 0 else 0.0
+        elif j == (n_cols - 1) and len(sigmas) >= 2 and sigmas[j-2] != 0 and den_sd != 0:
+            # Specjalna logika dla ostatniej kolumny
+            sigma = min(sigmas[j-1]**4 / sigmas[j-2]**2, min(sigmas[j-2]**2, sigmas[j-1]**2))
+            sd_val = sigma / den_sd
+        else:
+            sigma = 0.0
+            sd_val = 0.0
+        
+        sigmas.append(sigma)
+        sds.append(sd_val)
+    
+    return sigmas, sds
+
+
+
+@njit
+def choose_value_list(vec_input, vec_wykluczenia, a, b):
+    count = 0
+    for k in range(len(vec_wykluczenia)):
+        idx = vec_wykluczenia[k] - 1
+        val = vec_input[idx]
+        if a < val < b:
+            count += 1
+
+    out_vals = np.empty(count)
+    out_inds = np.empty(count, dtype=np.int64)
+
+    pos = 0
+    for k in range(len(vec_wykluczenia)):
+        idx = vec_wykluczenia[k] - 1
+        val = vec_input[idx]
+        if a < val < b:
+            out_vals[pos] = val
+            out_inds[pos] = idx
+            pos += 1
+
+    return out_vals, out_inds
+
+@njit
+def fit_curve_factor_cl(data_input, sd_input, x_k):
+    n = len(data_input)
+    se2 = sd_input 
+    w = np.empty(n)
+    for i in range(n):
+        denom = (data_input[i] - 1) ** 2
+        w[i] = 1.0 / np.sqrt(np.log(1.0 + se2[i] / denom)) if denom > 0.0 else 0
+    y = np.log(data_input - 1.0)
+    A = A_x = A_xx = A_y = A_xy = 0.0
+    for i in range(n):
+        wi = w[i]
+        xi = x_k[i]
+        yi = y[i]
+        A += wi
+        A_x += wi * xi
+        A_xx += wi * xi * xi
+        A_y += wi * yi
+        A_xy += wi * xi * yi
+    Delta = A * A_xx - A_x * A_x
+    if Delta == 0.0:
+        return 0.0, 0.0
+    a_coef = (A * A_xy - A_x * A_y) / Delta
+    b_coef = (A_xx * A_y - A_x * A_xy) / Delta
+    return a_coef, b_coef
+
+@njit
+def wspolczynnik_reg_factor_cl(a_coef, b_coef, k_start, k_stop):
+    n = k_stop - k_start + 1
+    out = np.empty(n)
+    for i in range(n):
+        k = k_start + i
+        out[i] = 1.0 + np.exp(a_coef * k + b_coef)
+    return out
+
+
+@njit
+def wspolczynnik_reg_factor_P_to_I(a_coef, b_coef, k_start, k_stop):
+    k_values = np.arange(k_start, k_stop + 1)
+    exponent = np.exp(a_coef * k_values + b_coef)
+    wartosci_reg = 1.0 - exponent
+    return wartosci_reg
+
+
+@njit
+def triangle_forward_one_np(triangle_input, f, k_forward_start):
+    mm, nn = triangle_input.shape
+    req_cols = len(f) + 1
+    tri = np.zeros((mm, req_cols))
+    # kopiuj istniejące dane
+    for i in range(mm):
+        for j in range(nn):
+            tri[i, j] = triangle_input[i, j]
+    # projekcja
+    for j in range(k_forward_start - 1, len(f)):
+        if j + 1 >= req_cols:
+            continue
+        max_row = max(0, mm - j - 1)
+        for i in range(max_row, mm):
+            tri[i, j + 1] = tri[i, j] * f[j]
+    return tri
+
+
+
+
+
+####
+
+@njit
+def vector_reverse_diagonal(data: np.ndarray):
+    """Zwraca wektor elementów odwrotnej przekątnej (ostatniej pełnej diagonali)."""
+    rows, cols = data.shape
+    result = []
+    for i in range(rows):
+        j = cols - 1 - i
+        if 0 <= j < cols:
+            v = data[i, j]
+            if not np.isnan(v):
+                result.append(v)
+    return np.array(result)
+
+
+@njit
+def _build_base_triangle_cladd(data_paid, n_dev):
+    """
+    Buduje bazę trójkąta o wymiarze (mm, n_dev+1) kopiując dane
+    i dopełniając NaN.
+    """
+    mm, n_cols_orig = data_paid.shape
+    total_cols = n_dev + 1
+    base = np.empty((mm, total_cols), dtype=np.float64)
+
+    for i in range(mm):
+        for j in range(total_cols):
+            if j < n_cols_orig:
+                base[i, j] = data_paid[i, j]
+            else:
+                base[i, j] = np.nan
+    return base
+
+
+@njit
+def transform_data_cladd(data_input, exposure):
+    """
+    Transformacja do LR-inkrementów:
+    col0: C_{i,0} / exposure[i]
+    colj: (C_{i,j}-C_{i,j-1}) / exposure[i]
+    """
+    n, m = data_input.shape
+    data_input = data_input[:, :(n + 1)]
+
+    output = np.empty((n, m))
+
+    for i in range(n):
+        output[i, 0] = data_input[i, 0] / exposure[i]
+
+    for j in range(1, m):
+        for i in range(n):
+            if not np.isnan(data_input[i, j]):
+                output[i, j] = (data_input[i, j] - data_input[i, j - 1]) / exposure[i]
+
+    return output
+
+#######################
+
+@njit
+def choose_value_list(vec_input, vec_wykluczenia, a, b):
+    """
+    Wybiera wartości z vec_input wg indeksów w vec_wykluczenia (1-based),
+    filtrując do przedziału (a, b). Zwraca (wartosci, indeksy_0based).
+    """
+    count = 0
+    for k in range(len(vec_wykluczenia)):
+        idx = vec_wykluczenia[k] - 1
+        val = vec_input[idx]
+        if a < val < b:
+            count += 1
+
+    out_vals = np.empty(count)
+    out_inds = np.empty(count, dtype=np.int64)
+
+    pos = 0
+    for k in range(len(vec_wykluczenia)):
+        idx = vec_wykluczenia[k] - 1
+        val = vec_input[idx]
+        if a < val < b:
+            out_vals[pos] = val
+            out_inds[pos] = idx
+            pos += 1
+
+    return out_vals, out_inds
+
+
+@njit(fastmath=False)
+def fit_curve_factor_lr(data_input, sd_input, x_k):
+    """
+    Dopasowanie krzywej: log(y)=a*k+b, gdzie y=data_input.
+    Wagi zależą od błędu (sd_input).
+    Zwraca (a_coef, b_coef).
+    """
+    n = len(data_input)
+    se2 = sd_input ** 2
+    w = np.empty(n)
+
+    for i in range(n):
+        denom = data_input[i] ** 2
+        w_mian = np.sqrt(np.log(1.0 + se2[i] / denom)) if denom != 0.0 else 0.0
+        if w_mian != 0.0:
+            w[i] = 1.0 / w_mian
+        else:
+            w[i] = 0.0
+
+    y = np.empty(n)
+    for i in range(n):
+        if data_input[i] > 0.0:
+            y[i] = np.log(data_input[i])
+        else:
+            y[i] = 0.0
+
+    A = A_x = A_xx = A_y = A_xy = 0.0
+    for i in range(n):
+        wi = w[i]
+        xi = x_k[i]
+        yi = y[i]
+        A += wi
+        A_x += wi * xi
+        A_xx += wi * xi * xi
+        A_y += wi * yi
+        A_xy += wi * xi * yi
+
+    Delta = A * A_xx - A_x * A_x
+    if Delta == 0.0:
+        return 0.0, 0.0
+
+    a_coef = (A * A_xy - A_x * A_y) / Delta
+    b_coef = (A_xx * A_y - A_x * A_xy) / Delta
+    return a_coef, b_coef
+
+
+@njit
+def wspolczynnik_reg_factor_lr(a_coef, b_coef, k_start, k_stop):
+    """
+    Ogon: exp(a*k+b) dla k=k_start..k_stop (włącznie).
+    """
+    n = k_stop - k_start + 1
+    out = np.empty(n)
+    for i in range(n):
+        k = k_start + i
+        out[i] = np.exp(a_coef * k + b_coef)
+    return out
+
+
+@njit
+def _build_base_triangle(data_paid, n_dev):
+    """
+    Buduje bazę trójkąta o wymiarze (mm, n_dev+1) kopiując dane
+    i dopełniając NaN.
+    """
+    mm, n_cols_orig = data_paid.shape
+    total_cols = n_dev + 1
+    base = np.empty((mm, total_cols), dtype=np.float64)
+
+    for i in range(mm):
+        for j in range(total_cols):
+            if j < n_cols_orig:
+                base[i, j] = data_paid[i, j]
+            else:
+                base[i, j] = np.nan
+    return base
+
+
+@njit
+def triangle_forward_loss_ratio_numba(tri_in, LR_j, exposure, k_forward):
+    """
+    Projekcja LR: C_{i,j+1} = C_{i,j} + exposure[i] * LR_j[j]
+    """
+    mm, n_cols_orig = tri_in.shape
+    n_cols_out = max(n_cols_orig, len(LR_j) + 1)
+
+    tri = np.empty((mm, n_cols_out), dtype=np.float64)
+    tri[:] = np.nan
+
+    for i in range(mm):
+        for j in range(n_cols_orig):
+            tri[i, j] = tri_in[i, j]
+
+    for j in range(k_forward):
+        max_ind_row = 1 if (mm - j) < 1 else (mm - j)
+        start_row = max_ind_row - 1
+        for i in range(start_row, mm):
+            base_val = tri[i, j]
+            tri[i, j + 1] = base_val + exposure[i] * LR_j[j]
+
+    return tri
+
+
+@njit
+def sum_reverse_diagonal(data):
+    """
+    Suma elementów odwrotnej przekątnej (ostatniej pełnej diagonali).
+    """
+    tot = 0.0
+    rows, cols = data.shape
+    for i in range(rows):
+        j = cols - 1 - i
+        if 0 <= j < cols:
+            v = data[i, j]
+            if not np.isnan(v):
+                tot += v
+    return tot
+
+
+@njit
+def vector_reverse_diagonal(data):
+    """
+    Zwraca wektor elementów odwrotnej przekątnej (ostatniej pełnej diagonali).
+    """
+    rows, cols = data.shape
+    result = []
+    for i in range(rows):
+        j = cols - 1 - i
+        if 0 <= j < cols:
+            v = data[i, j]
+            if not np.isnan(v):
+                result.append(v)
+    return np.array(result)
+
+
+@njit
+def transform_data(data_input, exposure):
+    """
+    Transformacja do LR-inkrementów:
+    col0: C_{i,0} / exposure[i]
+    colj: (C_{i,j}-C_{i,j-1}) / exposure[i]
+    """
+    n, m = data_input.shape
+    data_input = data_input[:, :(n + 1)]
+
+    output = np.empty((n, m))
+
+    for i in range(n):
+        output[i, 0] = data_input[i, 0] / exposure[i]
+
+    for j in range(1, m):
+        for i in range(n):
+            if not np.isnan(data_input[i, j]):
+                output[i, j] = (data_input[i, j] - data_input[i, j - 1]) / exposure[i]
+
+    return output
+
+
+@njit
+def wspolczynnik_LR(data_LR, w, exposure):
+    """
+    LR_j = sum_i(lr_ij * w_ij * e_i) / sum_i(w_ij * e_i)
+    """
+    n, m = data_LR.shape
+    wsp_LR = np.empty(m)
+
+    for j in range(m):
+        numerator = 0.0
+        denominator = 0.0
+
+        for i in range(n):
+            lr_ij = data_LR[i, j]
+            w_ij = w[i, j]
+            e_i = exposure[i]
+
+            if not np.isnan(lr_ij) and not np.isnan(w_ij) and not np.isnan(e_i) and w_ij > 0.0:
+                numerator += lr_ij * w_ij * e_i
+                denominator += w_ij * e_i
+
+        if denominator == 0.0:
+            wsp_LR[j] = 0.0
+        else:
+            wsp_LR[j] = numerator / denominator
+
+    return wsp_LR
+
+
+@njit
+def sigma_LR(data_LR, w, exposure, wsp_LR):
+    """
+    Sigma dla LR (wariancja ważona): sum(w*e*(lr-mean)^2)/(sum(w)-1)
+    """
+    n, m = data_LR.shape
+    sigma_j = np.empty(m)
+    for j in range(m):
+        sum_num = 0.0
+        sum_denom = 0.0
+        mean_j = wsp_LR[j]
+        for i in range(n):
+            lr = data_LR[i, j]
+            wij = w[i, j]
+            ei = exposure[i]
+            if not np.isnan(wij) and wij>0.0  :
+                sum_num += wij * ei * (lr - mean_j) ** 2
+                sum_denom += wij
+        if sum_denom > 1.0:
+            sigma_j[j] = sum_num / (sum_denom - 1.0)
+        else:
+            sigma_j[j] = 0.0
+    return sigma_j
+
+
+@njit
+def wspolczynnik_sd(wsp_sigma, w, exposure):
+    """
+    sd_j = sqrt( sigma_j / sum_i(w_ij * e_i) )
+    """
+    n, m = w.shape
+    sd_j = np.empty(m)
+
+    for j in range(m):
+        denominator = 0.0
+        for i in range(n):
+            wij = w[i, j]
+            ei = exposure[i]
+            if not np.isnan(wij):
+                denominator += wij * ei
+
+        if denominator == 0.0 or wsp_sigma[j] == 0.0:
+            sd_j[j] = 0.0
+        else:
+            sd_j[j] = np.sqrt(wsp_sigma[j] / denominator)
+
+    return sd_j
+
+
+
+@njit
+def fit_curve_factor_P_to_I(data_input, x_k):
+    factor_input = np.log(1.0 - data_input)
+    w_k_sqr = np.ones(len(data_input))
+
+    A = np.sum(w_k_sqr)
+    A_x = np.sum(w_k_sqr * x_k)
+    A_xx = np.sum(w_k_sqr * x_k * x_k)
+    A_y = np.sum(w_k_sqr * factor_input)
+    A_xy = np.sum(w_k_sqr * x_k * factor_input)
+
+    Delta = A * A_xx - A_x * A_x
+    a_num = (A * A_xy - A_x * A_y) / Delta
+    b_num = (A_xx * A_y - A_x * A_xy) / Delta
+
+    return a_num, b_num
+
+
+@njit
+def run_simulation_addcl_numba_incurred(
+        dev_inc, sigma_inc, sd_inc,
+        rj, varj, r_i_j, lambda_cor,
+        data_paid_np, data_inc_np, weights_np, wykluczenia,
+        Poz_CL, data_wagi_pi, wykluczenia_p_i,
+        Poz_CL_p_i, dop_ogo_p_i,
+        il_ogon, discount_factors, net_to_gross,
+        sigma_inc_LR, dev_inc_LR, sd_inc_LR,
+        e_values, wagi_trimmed_LR,
+        ilosc_dop_wsp_LR, Poz_LR, il_ogon_LR,
+        k_zmiana,
+        sim_total=1, batch_sim=1, main_seed=202260011):
+
+
+    latest = vector_reverse_diagonal(data_paid_np)
+    mm, n_cols_orig = data_paid_np.shape
+    n_dev = len(dev_inc)
+
+    # ---------------------------------------------------------
+    # Walidacja trybu ADD / CL
+    # ---------------------------------------------------------
+    if k_zmiana < 0 or k_zmiana > n_dev:
+        raise ValueError(
+            "k_zmiana musi należeć do przedziału 0..len(dev_inc)"
+        )
+
+    # k_zmiana == 0 -> czysty CL. Parametry LR mogą być puste.
+    if k_zmiana > 0:
+        if len(dev_inc_LR) < k_zmiana:
+            raise ValueError(
+                "Dla k_zmiana > 0 dev_inc_LR musi zawierać co najmniej k_zmiana elementów."
+            )
+        if len(sigma_inc_LR) < k_zmiana:
+            raise ValueError(
+                "Dla k_zmiana > 0 sigma_inc_LR musi zawierać co najmniej k_zmiana elementów."
+            )
+        if len(sd_inc_LR) < k_zmiana:
+            raise ValueError(
+                "Dla k_zmiana > 0 sd_inc_LR musi zawierać co najmniej k_zmiana elementów."
+            )
+        if len(e_values) < mm:
+            raise ValueError(
+                "Dla k_zmiana > 0 e_values musi zawierać co najmniej mm elementów."
+            )
+        if wagi_trimmed_LR.shape[0] == 0 or wagi_trimmed_LR.shape[1] == 0:
+            raise ValueError(
+                "Dla k_zmiana > 0 wagi_trimmed_LR nie może być puste."
+            )
+
+    # ---------------------------------------------------------
+    # Bezpieczne discount_factors i net_to_gross
+    # ---------------------------------------------------------
+    discount_factors_safe = np.ones(n_dev)
+    up_to = min(len(discount_factors), n_dev)
+    for ii in range(up_to):
+        discount_factors_safe[ii] = discount_factors[ii]
+
+    net_to_gross_safe = np.ones(mm)
+    up_to = min(len(net_to_gross), mm)
+    for ii in range(up_to):
+        net_to_gross_safe[ii] = net_to_gross[ii]
+
+    r_j_sim_mean = np.zeros(n_cols_orig)
+    r_j_sim = np.zeros((sim_total, n_cols_orig))
+
+    # Trochę zapasu na projekcję z ogonem.
+    max_cols = n_dev + max(il_ogon, il_ogon_LR) + 3
+    all_incurred_triangles = np.zeros((sim_total, mm, max_cols))
+    all_paid_triangles = np.zeros((sim_total, mm, max_cols))
+    results = np.zeros((sim_total, 3))
+
+    # Poprawne batchowanie również wtedy, gdy sim_total % batch_sim != 0.
+    n_batches = (sim_total + batch_sim - 1) // batch_sim
+
+    total_f_len_cl = n_dev + il_ogon
+
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_sim
+        end = min(start + batch_sim, sim_total)
+        cur_bs = end - start
+
+        np.random.seed(main_seed + batch_idx)
+
+        # Korelacyjne szoki P/I - jak w obecnym INCURRED.
+        normal_shocks = np.random.normal(
+            loc=0.0,
+            scale=1.0,
+            size=(cur_bs, mm, n_dev)
+        )
+
+        # -----------------------------------------------------
+        # PARAMETER RISK - CL (obecna metoda INCURRED)
+        # -----------------------------------------------------
+        mu_part_inc = np.empty((cur_bs, n_dev))
+        sigma_part_inc = np.empty((cur_bs, n_dev))
+
+        for jj in range(n_dev):
+            mu_part_inc[:, jj] = np.random.normal(
+                loc=dev_inc[jj],
+                scale=sd_inc[jj],
+                size=cur_bs
+            )
+            df_cl = max(1, mm - jj - 2)
+            chi_list_cl = np.random.chisquare(df_cl, size=cur_bs)
+            for ss in range(cur_bs):
+                sigma_part_inc[ss, jj] = (
+                    chi_list_cl[ss] * sigma_inc[jj]
+                ) / df_cl
+
+        # -----------------------------------------------------
+        # PARAMETER RISK - ADD/LR
+        # Tablice LR istnieją ZAWSZE, nawet gdy k_zmiana == 0.
+        # Wtedy mają shape (cur_bs, 0), ale Numba zna ich typ float64.
+        # -----------------------------------------------------
+        mu_part_lr = np.empty(
+            (cur_bs, k_zmiana),
+            dtype=np.float64
+        )
+        sigma_part_lr = np.empty(
+            (cur_bs, k_zmiana),
+            dtype=np.float64
+        )
+
+        if k_zmiana > 0:
+            for jj in range(k_zmiana):
+                mu_part_lr[:, jj] = np.random.normal(
+                    loc=dev_inc_LR[jj],
+                    scale=sd_inc_LR[jj],
+                    size=cur_bs
+                )
+                df_lr = max(1, mm - jj)
+                chi_list_lr = np.random.chisquare(df_lr, size=cur_bs)
+                for ss in range(cur_bs):
+                    sigma_part_lr[ss, jj] = (
+                        chi_list_lr[ss] * sigma_inc_LR[jj]
+                    ) / df_lr
+
+        for s in range(cur_bs):
+            sim_idx = start + s
+
+            # -------------------------------------------------
+            # Wagi CL
+            # -------------------------------------------------
+            empty_row = np.full((1, weights_np.shape[1]), np.nan)
+            wagi_modified_row = np.vstack((weights_np, empty_row))
+            empty_column_cl = np.full((wagi_modified_row.shape[0], 1), np.nan)
+            wagi_modified = np.hstack((wagi_modified_row, empty_column_cl))
+
+            # -------------------------------------------------
+            # Wagi ADD/LR
+            # Tworzymy je ZAWSZE, aby Numba znała typ zmiennej.
+            # Przy pustym LR i k_zmiana == 0 będzie to pusta macierz
+            # z jedną techniczną kolumną, która nie zostanie użyta.
+            # -------------------------------------------------
+            empty_column_lr = np.full(
+                (wagi_trimmed_LR.shape[0], 1),
+                np.nan,
+                dtype=np.float64
+            )
+            wagi_modified_lr = np.hstack(
+                (wagi_trimmed_LR, empty_column_lr)
+            )
+
+            # -------------------------------------------------
+            # Wagi P/I
+            # -------------------------------------------------
+            empty_column_pi = np.full((data_wagi_pi.shape[0], 1), np.nan)
+            data_wagi_pi_modifited = np.hstack((data_wagi_pi, empty_column_pi))
+
+            m_i_inc = mu_part_inc[s, :]
+            sigma_i_inc = sigma_part_inc[s, :]
+
+            # Zawsze przypisujemy zmienne LR.
+            # Dla k_zmiana == 0 są to puste tablice float64 o shape (0,).
+            m_i_lr = mu_part_lr[s, :]
+            sigma_i_lr = sigma_part_lr[s, :]
+
+            # -------------------------------------------------
+            # Kopie trójkątów do pełnej symulacji
+            # -------------------------------------------------
+            data_paid_copy = data_paid_np.copy()
+            data_incurred_to_paid_copy = data_paid_np.copy()
+            data_incurred_copy = data_inc_np.copy()
+
+            # Zapewniamy co najmniej n_dev + 1 kolumn do pełnej projekcji.
+            n_cols_current = data_paid_copy.shape[1]
+            if n_cols_current < n_dev + 1:
+                extra_cols = (n_dev + 1) - n_cols_current
+                data_paid_copy = np.concatenate(
+                    (data_paid_copy, np.zeros((mm, extra_cols))), axis=1
+                )
+                data_incurred_copy = np.concatenate(
+                    (data_incurred_copy, np.zeros((mm, extra_cols))), axis=1
+                )
+                data_incurred_to_paid_copy = np.concatenate(
+                    (data_incurred_to_paid_copy, np.zeros((mm, extra_cols))), axis=1
+                )
+
+            # Trójkąty jednoroczne - zawsze dokładamy jedną kolumnę.
+            data_paid_to_one = np.concatenate(
+                (data_paid_np.copy(), np.zeros((mm, 1))), axis=1
+            )
+            data_incurred_to_one = np.concatenate(
+                (data_inc_np.copy(), np.zeros((mm, 1))), axis=1
+            )
+
+            # =================================================
+            # 1. SYMULACJA INCURRED + P/I
+            # =================================================
+            for j in range(n_dev):
+                max_ind_row = max(0, mm - j - 1)
+
+                for r in range(max_ind_row, mm):
+                    base_val = data_incurred_to_paid_copy[r, j]   # PAID(t)
+                    base_val_inc = data_incurred_copy[r, j]      # INCURRED(t)
+
+                    # Obecny model P/I wymaga dodatniego incurred w mianowniku.
+                    if base_val_inc == 0:
+                        continue
+
+                    active_weight = 0.0
+
+                    # -----------------------------------------
+                    # ADD / LR
+                    # -----------------------------------------
+                    if j < k_zmiana:
+                        var_ij_lr = sigma_i_lr[j] / e_values[r]
+
+                        if m_i_lr[j] > 0.0:
+                            lmean_lr = np.log(
+                                m_i_lr[j] ** 2 /
+                                np.sqrt(m_i_lr[j] ** 2 + var_ij_lr)
+                            )
+                            lstdev_lr = np.sqrt(
+                                np.log(
+                                    1.0 + var_ij_lr / (m_i_lr[j] ** 2)
+                                )
+                            )
+                            sto_lr = np.random.lognormal(lmean_lr, lstdev_lr)
+
+                            next_inc = (
+                                base_val_inc + e_values[r] * sto_lr
+                            )
+                        else:
+                            adj_mu_lr = (
+                                m_i_lr[j] + base_val_inc / e_values[r]
+                            )
+                            lmean_lr = np.log(
+                                adj_mu_lr ** 2 /
+                                np.sqrt(adj_mu_lr ** 2 + var_ij_lr)
+                            )
+                            lstdev_lr = np.sqrt(
+                                np.log(
+                                    1.0 + var_ij_lr / (adj_mu_lr ** 2)
+                                )
+                            )
+                            sto_lr = np.random.lognormal(lmean_lr, lstdev_lr)
+
+                            next_inc = (
+                                e_values[r] *
+                                (sto_lr - base_val_inc / e_values[r]) +
+                                base_val_inc
+                            )
+
+                        # Waga LR dla nowej przekątnej - 1:1 z logiką PAID ADD.
+                        if r == mm - j - 1 and j < mm:
+                            dev_con_lr = dev_inc_LR[j]
+                            std_con_lr = sd_inc_LR[j]
+
+                            if (
+                                dev_con_lr - 2.0 * std_con_lr
+                                <= sto_lr <=
+                                dev_con_lr + 2.0 * std_con_lr
+                            ):
+                                active_weight = 1.0
+                            elif (
+                                (dev_con_lr - 3.0 * std_con_lr
+                                 <= sto_lr <=
+                                 dev_con_lr - 2.0 * std_con_lr)
+                                or
+                                (dev_con_lr + 2.0 * std_con_lr
+                                 <= sto_lr <=
+                                 dev_con_lr + 3.0 * std_con_lr)
+                            ):
+                                active_weight = 0.5
+                            else:
+                                active_weight = 0.0
+
+                            wagi_modified_lr[r, j + 1] = active_weight
+
+                    # -----------------------------------------
+                    # CL
+                    # -----------------------------------------
+                    else:
+                        var_ij_inc = sigma_i_inc[j] / base_val_inc
+                        m_sq_inc = m_i_inc[j] * m_i_inc[j]
+
+                        denom_inc = np.sqrt(m_sq_inc + var_ij_inc)
+                        lmean_inc = np.log(m_sq_inc / denom_inc)
+                        lstdev_inc = np.sqrt(
+                            np.log(1.0 + (var_ij_inc / m_sq_inc))
+                        )
+                        cl_ij_inc = np.random.lognormal(
+                            lmean_inc, lstdev_inc
+                        )
+
+                        next_inc = base_val_inc * cl_ij_inc
+
+                        # Zachowujemy obecną logikę wag CL z INCURRED.
+                        if r == mm - j - 1 and j < mm:
+                            dev_con = dev_inc[j]
+                            std_con = sd_inc[j]
+
+                            if (
+                                dev_con - 2.0 * std_con
+                                <= cl_ij_inc <=
+                                dev_con + 2.0 * std_con
+                            ):
+                                active_weight = 1.0
+                            elif (
+                                (dev_con - 3.0 * std_con
+                                 <= cl_ij_inc <
+                                 dev_con - 2.0 * std_con)
+                                or
+                                (dev_con + 2.0 * std_con
+                                 < cl_ij_inc <=
+                                 dev_con + 3.0 * std_con)
+                            ):
+                                active_weight = 0.5
+                            else:
+                                active_weight = 0.0
+
+                            wagi_modified[r, j] = active_weight
+
+                    # -----------------------------------------
+                    # P/I - wspólne dla ADD i CL
+                    # -----------------------------------------
+                    if varj[j] == 0:
+                        res_before = 0.0
+                    else:
+                        res_before = (
+                            ((base_val / base_val_inc) - rj[j]) /
+                            np.sqrt(varj[j] / base_val_inc)
+                        )
+
+                    r_i_j_sim = (
+                        rj[j + 1]
+                        +
+                        np.sqrt(varj[j + 1] / next_inc)
+                        *
+                        (
+                            normal_shocks[s, r, j]
+                            + res_before * lambda_cor[0]
+                        )
+                    )
+
+                    val_paid = next_inc * r_i_j_sim
+
+                    data_incurred_copy[r, j + 1] = next_inc
+                    data_incurred_to_paid_copy[r, j + 1] = val_paid
+
+                    if r == mm - j - 1:
+                        data_paid_to_one[r, j + 1] = val_paid
+                        data_incurred_to_one[r, j + 1] = next_inc
+                        data_paid_copy[r, j + 1] = val_paid
+                        data_wagi_pi_modifited[r, j + 1] = active_weight
+
+            # =================================================
+            # 2. JEDNOROCZNA REESTYMACJA
+            # =================================================
+            data_incurred_to_one[1:, n_cols_orig] = np.nan
+            data_paid_to_one[1:, n_cols_orig] = np.nan
+
+            # -------------------------------------------------
+            # CL - pozostawione zgodnie z obecnym INCURRED
+            # -------------------------------------------------
+            dev_j = Dev_prem(data_incurred_to_one, wagi_modified)
+            l_ij = elementwise_division(data_incurred_to_one)
+            sigma_all = calculate_sigma(
+                data_incurred_to_one,
+                l_ij,
+                wagi_modified,
+                dev_j
+            )
+            # calculate_sigma zwraca tutaj listę; konwersja do ndarray
+            # pozwala indeksować przez tablicę ind_choode w Numbie.
+            sd_sim = np.array(sigma_all[1])
+
+            dev_sel, ind_choode = choose_value_list(
+                dev_j, wykluczenia, 1, 10
+            )
+            sd_sel = sd_sim[ind_choode]
+
+            sd_sel_ind = np.array(
+                [ii for ii, x in enumerate(sd_sel) if x > 0],
+                dtype=np.int64
+            )
+            sd_sel = sd_sel[sd_sel_ind]
+            dev_sel = dev_sel[sd_sel_ind]
+
+            # Jedyna techniczna korekta: x_k musi być filtrowane tak samo.
+            x_k = (ind_choode + 1)[sd_sel_ind]
+
+            a_coef, b_coef = fit_curve_factor_cl(
+                dev_sel, sd_sel, x_k
+            )
+
+            total_f_len_cl = len(dev_j) + il_ogon
+
+            if Poz_CL - 1 > 0:
+                vec_f = np.empty(total_f_len_cl - 2)
+                vec_f[:(Poz_CL - 1)] = dev_j[1:Poz_CL]
+                vec_f[(Poz_CL - 1):] = 1.0
+            else:
+                vec_f = wspolczynnik_reg_factor_cl(
+                    a_coef,
+                    b_coef,
+                    2,
+                    total_f_len_cl - 1
+                )
+
+            # -------------------------------------------------
+            # ADD / LR - przeniesione z hybrydowego PAID
+            # -------------------------------------------------
+            if k_zmiana > 0:
+                LR_i_j_stoch = transform_data(
+                    data_incurred_to_one,
+                    e_values
+                )
+                LR_j_wyzn = wspolczynnik_LR(
+                    LR_i_j_stoch,
+                    wagi_modified_lr,
+                    e_values
+                )
+                sigma_j_pred = sigma_LR(
+                    LR_i_j_stoch,
+                    wagi_modified_lr,
+                    e_values,
+                    LR_j_wyzn
+                )
+                sd_j = wspolczynnik_sd(
+                    sigma_j_pred,
+                    wagi_modified_lr,
+                    e_values
+                )
+
+                vector_value, x_k_ind = choose_value_list(
+                    LR_j_wyzn,
+                    ilosc_dop_wsp_LR,
+                    0,
+                    10
+                )
+                sd_input = sd_j[x_k_ind]
+
+                a_lr, b_lr = fit_curve_factor_lr(
+                    vector_value,
+                    sd_input,
+                    x_k_ind
+                )
+
+                total_f_len_lr = (
+                    len(LR_j_wyzn) + il_ogon_LR + 1
+                )
+                vec_lr = np.empty(total_f_len_lr - 2)
+
+                if Poz_LR - 2 > 0:
+                    vec_lr[:(Poz_LR - 2)] = LR_j_wyzn[2:Poz_LR]
+
+                tail_factors_lr = wspolczynnik_reg_factor_lr(
+                    float(a_lr),
+                    float(b_lr),
+                    Poz_LR,
+                    total_f_len_lr - 1
+                )
+
+                lr_start = max(0, Poz_LR - 2)
+                lr_remaining = len(vec_lr) - lr_start
+                if lr_remaining > 0:
+                    vec_lr[lr_start:] = tail_factors_lr[:lr_remaining]
+            else:
+                vec_lr = np.empty(0, dtype=np.float64)
+
+            # =================================================
+            # 3. FINALNA PROJEKCJA INCURRED: ADD + CL
+            # =================================================
+            data_paid_to_one_new = data_paid_to_one[:, 1:]
+            data_incurred_to_one_new = data_incurred_to_one[:, 1:(n_cols_orig + 1)]
+
+            tri_sim = data_incurred_to_one_new
+
+            target_cols = len(vec_f) + 1
+            pad_width = target_cols - tri_sim.shape[1]
+
+            if pad_width > 0:
+                tri_proj_tmp = np.hstack(
+                    (tri_sim, np.full((mm, pad_width), np.nan))
+                )
+            else:
+                tri_proj_tmp = tri_sim.copy()
+
+            if k_zmiana > len(vec_lr):
+                raise ValueError(
+                    "k_zmiana jest większe niż liczba dostępnych współczynników LR"
+                )
+
+            for j in range(len(vec_f)):
+                max_ind_row = max(0, mm - j - 1)
+
+                for rr in range(max_ind_row, mm):
+                    if j < k_zmiana:
+                        tri_proj_tmp[rr, j + 1] = (
+                            tri_proj_tmp[rr, j]
+                            + e_values[rr] * vec_lr[j]
+                        )
+                    else:
+                        tri_proj_tmp[rr, j + 1] = (
+                            tri_proj_tmp[rr, j] * vec_f[j]
+                        )
+
+            actual_cols = tri_proj_tmp.shape[1]
+            all_incurred_triangles[
+                sim_idx, :, :actual_cols
+            ] = tri_proj_tmp
+
+            # =================================================
+            # 4. JEDNOROCZNE P/I - bez zmiany metodologii
+            # =================================================
+            mm_local, nn = data_paid_to_one_new.shape
+
+            for jjj in range(nn):
+                licznik = 0.0
+                mianownik = 0.0
+
+                for iii in range(mm_local):
+                    if (
+                        data_wagi_pi_modifited[iii, jjj] != 0
+                        and not np.isnan(data_wagi_pi_modifited[iii, jjj])
+                    ):
+                        licznik += (
+                            data_wagi_pi_modifited[iii, jjj]
+                            * data_paid_to_one[iii, jjj]
+                        )
+                        mianownik += (
+                            data_wagi_pi_modifited[iii, jjj]
+                            * data_incurred_to_one[iii, jjj]
+                        )
+
+                if mianownik == 0:
+                    r_j_sim[sim_idx, jjj] = 1.0
+                else:
+                    r_j_sim[sim_idx, jjj] = licznik / mianownik
+
+            # Ultimate z pełnej symulacji paid - jak dotychczas.
+            u_i = data_incurred_to_paid_copy[:, -1]
+            results[sim_idx, 0] = np.sum(u_i)
+
+            actual_paid_cols = data_paid_copy.shape[1]
+            all_paid_triangles[
+                sim_idx, :, :actual_paid_cols
+            ] = data_paid_copy
+
+    # =========================================================
+    # 5. ŚREDNI P/I I WEKTOR P/I
+    # =========================================================
+    for ii in range(n_cols_orig):
+        suma = 0.0
+        for jj in range(sim_total):
+            suma += r_j_sim[jj, ii]
+        r_j_sim_mean[ii] = suma / sim_total
+
+    rj_choose, ind_choose = choose_value_list(
+        r_j_sim_mean,
+        wykluczenia_p_i,
+        0,
+        1
+    )
+
+    a_num, b_num = fit_curve_factor_P_to_I(
+        rj_choose,
+        ind_choose + 1
+    )
+
+    if Poz_CL_p_i - 1 > 0:
+        vec_p_i = np.empty(total_f_len_cl - 1)
+        vec_p_i[:(Poz_CL_p_i)] = r_j_sim_mean[:Poz_CL_p_i]
+        vec_p_i[(Poz_CL_p_i):] = wspolczynnik_reg_factor_P_to_I(
+            float(a_num),
+            float(b_num),
+            Poz_CL_p_i+1,
+            total_f_len_cl-1
+        )
+
+        # Zachowanie 1:1 z obecnym kodem.
+        if dop_ogo_p_i is True:
+            vec_p_i[(Poz_CL_p_i):] = 1.0
+        else:
+            vec_p_i[(Poz_CL_p_i):] = 1.0
+    else:
+        vec_p_i = wspolczynnik_reg_factor_P_to_I(
+            float(a_num),
+            float(b_num),
+            2,
+            total_f_len_cl
+        )
+
+    # =========================================================
+    # 6. INCURRED -> PAID + DYSKONTOWANIE
+    # =========================================================
+    for trian_sim_num in range(all_incurred_triangles.shape[0]):
+        trian_sim = all_incurred_triangles[trian_sim_num, :, :]
+        trian_sim_paid_one = all_paid_triangles[trian_sim_num, :, 1:]
+
+        max_j_col = min(
+            trian_sim_paid_one.shape[1],
+            vec_p_i.shape[0],
+            trian_sim.shape[1]
+        )
+
+        for j_col in range(1, max_j_col):
+            max_ind_row = max(
+                0,
+                trian_sim_paid_one.shape[0] - j_col
+            )
+
+            for ii in range(max_ind_row, trian_sim.shape[0]):
+                if (
+                    j_col < vec_p_i.shape[0]
+                    and j_col < trian_sim.shape[1]
+                ):
+                    trian_sim_paid_one[ii, j_col] = (
+                        trian_sim[ii, j_col] * vec_p_i[j_col+1]
+                    )
+
+        # Pozostawione zgodnie z obecnym INCURRED.
+        cols_tmp = max_j_col - 1
+        tri_proj = np.empty((mm, cols_tmp + 1))
+        tri_proj[:, 0] = data_paid_np[:, 0]
+
+        for rr in range(mm):
+            for cc in range(
+                min(cols_tmp, trian_sim_paid_one.shape[1])
+            ):
+                tri_proj[rr, cc + 1] = trian_sim_paid_one[rr, cc]
+
+        inc_proj = tri_proj[:, 1:] - tri_proj[:, :-1]
+
+        inc_disc = np.empty_like(tri_proj)
+        inc_disc[:, 0] = tri_proj[:, 0]
+
+        for rr in range(mm):
+            for cc in range(1, tri_proj.shape[1]):
+                inc_disc[rr, cc] = inc_proj[rr, cc - 1]
+
+        for rr in range(mm - 1, -1, -1):
+            offset = mm - 1 - rr
+            for cc in range(offset + 1, tri_proj.shape[1]):
+                idx = cc - (offset + 1)
+                if idx < len(discount_factors_safe):
+                    inc_disc[rr, cc] /= discount_factors_safe[idx]
+
+        cum_disc = inc_disc.copy()
+
+        for rr in range(mm):
+            for cc in range(1, tri_proj.shape[1]):
+                cum_disc[rr, cc] += cum_disc[rr, cc - 1]
+
+        cum_disc_ost = cum_disc[:, -1]
+        ult_gross_disc = np.sum(cum_disc_ost)
+
+        ult_net_disc = 0.0
+        for i_net in range(len(latest)):
+            ult_net_disc += (
+                latest[i_net] + (cum_disc_ost[i_net] - latest[i_net]) * net_to_gross_safe[i_net]
+            )
+
+
+        results[trian_sim_num, 1] = ult_gross_disc
+        results[trian_sim_num, 2] = ult_net_disc
+
+    return results
+
+@njit
+def run_simulation_cl_numba_incurred(
+        dev_inc,
+        sigma_inc,
+        sd_inc,
+        rj,
+        varj,
+        r_i_j,
+        lambda_cor,
+        data_paid_np,
+        data_inc_np,
+        weights_np,
+        wykluczenia,
+        Poz_CL,
+        data_wagi_pi,
+        wykluczenia_p_i,
+        Poz_CL_p_i,
+        dop_ogo_p_i,
+        il_ogon,
+        discount_factors,
+        net_to_gross,
+        sim_total=1,
+        batch_sim=1,
+        main_seed=42):
+
+    latest = vector_reverse_diagonal(data_paid_np)
+
+    mm, n_cols_orig = data_paid_np.shape
+
+    r_j_sim_mean = np.zeros(n_cols_orig)
+
+    # r_j_sim_mean[0] = 0.814554021011695
+
+    n_dev = len(dev_inc)
+
+    r_j_sim = np.zeros(
+        (sim_total, n_cols_orig)
+    )
+
+    all_incurred_triangles = np.zeros(
+        (sim_total, mm, n_dev + 1)
+    )
+
+    all_paid_triangles = np.zeros(
+        (sim_total, mm, n_dev + 1)
+    )
+
+    results = np.zeros(
+        (sim_total, 3)
+    )
+
+    num_batches = sim_total // batch_sim
+
+    np_liczby = np.random.randint(
+        -10000,
+        10000,
+        size=num_batches
+    )
+
+    results = np.zeros(
+        (sim_total, 3)
+    )
+
+    for batch in range(num_batches):
+
+        # seed = main_seed + 0
+
+        seed = main_seed + np_liczby[batch]
+
+        np.random.seed(seed)
+
+        normal_shocks = np.random.normal(
+            loc=0.0,
+            scale=1.0,
+            size=(batch_sim, mm, n_dev)
+        )
+
+        mu_part_inc = np.empty(
+            (batch_sim, n_dev)
+        )
+
+        sigma_part_inc = np.empty(
+            (batch_sim, n_dev)
+        )
+
+        for jj in range(n_dev):
+
+            mu_part_inc[:, jj] = np.random.normal(
+                loc=dev_inc[jj],
+                scale=sd_inc[jj],
+                size=batch_sim
+            )
+
+            df = max(
+                1,
+                mm - jj - 2
+            )
+
+            chi_list = np.random.chisquare(
+                df,
+                size=batch_sim
+            )
+
+            for s in range(batch_sim):
+
+                sigma_part_inc[s, jj] = (
+                    chi_list[s]
+                    * sigma_inc[jj]
+                ) / df
+
+        for i in range(batch_sim):
+
+            empty_row = np.full(
+                (1, weights_np.shape[1]),
+                np.nan
+            )
+
+            wagi_modified_row = np.vstack(
+                (
+                    weights_np,
+                    empty_row
+                )
+            )
+
+            empty_column = np.full(
+                (
+                    wagi_modified_row.shape[0],
+                    1
+                ),
+                np.nan
+            )
+
+            wagi_modified = np.hstack(
+                (
+                    wagi_modified_row,
+                    empty_column
+                )
+            )
+
+            empty_column = np.full(
+                (
+                    data_wagi_pi.shape[0],
+                    1
+                ),
+                np.nan
+            )
+
+            data_wagi_pi_modified = np.hstack(
+                (
+                    data_wagi_pi,
+                    empty_column
+                )
+            )
+
+            m_i_inc = mu_part_inc[i, :]
+
+            sigma_i_inc = sigma_part_inc[i, :]
+
+            data_paid_copy = data_paid_np.copy()
+
+            data_incurred_to_paid_copy = (
+                data_paid_np.copy()
+            )
+
+            data_incurred_copy = (
+                data_inc_np.copy()
+            )
+
+            data_paid_to_one = (
+                data_paid_np.copy()
+            )
+
+            data_incurred_to_one = (
+                data_inc_np.copy()
+            )
+
+            n_cols_current = (
+                data_paid_copy.shape[1]
+            )
+
+            if n_cols_current < n_dev + 1:
+
+                extra_cols = (
+                    n_dev + 1
+                ) - n_cols_current
+
+                data_paid_copy = np.concatenate(
+                    (
+                        data_paid_copy,
+                        np.zeros(
+                            (
+                                mm,
+                                extra_cols
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+                data_incurred_copy = np.concatenate(
+                    (
+                        data_incurred_copy,
+                        np.zeros(
+                            (
+                                mm,
+                                extra_cols
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+                data_incurred_copy_cl = np.concatenate(
+                    (
+                        data_incurred_copy,
+                        np.zeros(
+                            (
+                                mm,
+                                extra_cols
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+                data_incurred_to_paid_copy = np.concatenate(
+                    (
+                        data_incurred_to_paid_copy,
+                        np.zeros(
+                            (
+                                mm,
+                                extra_cols
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+                data_paid_to_one = (
+                    data_paid_np.copy()
+                )
+
+                data_paid_to_one = np.concatenate(
+                    (
+                        data_paid_to_one,
+                        np.zeros(
+                            (
+                                mm,
+                                1
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+                data_incurred_to_one = np.concatenate(
+                    (
+                        data_incurred_to_one,
+                        np.zeros(
+                            (
+                                mm,
+                                1
+                            )
+                        )
+                    ),
+                    axis=1
+                )
+
+            else:
+                # zabezpieczenie przed niezainicjalizowaną zmienną
+                data_incurred_copy_cl = (
+                    data_incurred_copy.copy()
+                )
+
+            n_cols_current = (
+                data_paid_copy.shape[1]
+            )
+
+            for j in range(n_dev):
+
+                max_ind_row = max(
+                    0,
+                    mm - j - 1
+                )
+
+                for r in range(
+                    max_ind_row,
+                    mm
+                ):
+
+                    base_val = (
+                        data_incurred_to_paid_copy[
+                            r,
+                            j
+                        ]
+                    )
+
+                    base_val_inc = (
+                        data_incurred_copy[
+                            r,
+                            j
+                        ]
+                    )
+
+                    if base_val_inc == 0:
+                        continue
+
+                    var_ij_inc = (
+                        sigma_i_inc[j]
+                        / base_val_inc
+                    )
+
+                    m_sq_inc = (
+                        m_i_inc[j]
+                        * m_i_inc[j]
+                    )
+
+                    denom_inc = np.sqrt(
+                        m_sq_inc
+                        + var_ij_inc
+                    )
+
+                    dev_con = m_i_inc[j]
+
+                    std_con = np.sqrt(
+                        var_ij_inc
+                    )
+
+                    # dev_con = dev_inc[j]
+                    # std_con = sd_inc[j]
+
+                    lmean_inc = np.log(
+                        m_sq_inc
+                        / denom_inc
+                    )
+
+                    lstdev_inc = np.sqrt(
+                        np.log(
+                            1
+                            +
+                            (
+                                var_ij_inc
+                                / m_sq_inc
+                            )
+                        )
+                    )
+
+                    cl_ij_inc = (
+                        np.random.lognormal(
+                            lmean_inc,
+                            lstdev_inc
+                        )
+                    )
+
+                    if varj[j] == 0:
+
+                        r_i_j_sim_ind = 1
+
+                    else:
+
+                        res_before = (
+                            (
+                                (
+                                    base_val
+                                    / base_val_inc
+                                )
+                                - rj[j]
+                            )
+                            /
+                            np.sqrt(
+                                varj[j]
+                                / base_val_inc
+                            )
+                        )
+
+                        r_i_j_sim_ind = (
+                            rj[j + 1]
+                            +
+                            (
+                                np.sqrt(
+                                    varj[j + 1]
+                                    /
+                                    (
+                                        base_val_inc
+                                        * cl_ij_inc
+                                    )
+                                )
+                            )
+                            *
+                            (
+                                normal_shocks[
+                                    i,
+                                    r,
+                                    j
+                                ]
+                                +
+                                res_before
+                                * lambda_cor[0]
+                            )
+                        )
+
+                    data_incurred_copy[
+                        r,
+                        j + 1
+                    ] = (
+                        base_val_inc
+                        * cl_ij_inc
+                    )
+
+                    data_incurred_copy_cl[
+                        r,
+                        j + 1
+                    ] = cl_ij_inc
+
+                    r_i_j_sim = min(
+                        r_i_j_sim_ind,
+                        1.0
+                    )
+
+                    # r_i_j_sim = 1
+
+                    val_paid = (
+                        base_val_inc
+                        * cl_ij_inc
+                        * r_i_j_sim
+                    )
+
+                    data_incurred_to_paid_copy[
+                        r,
+                        j + 1
+                    ] = val_paid
+
+                    if r == mm - j - 1:
+
+                        # val_paid = base_val_inc * cl_ij_inc * 1
+
+                        data_paid_to_one[
+                            r,
+                            j + 1
+                        ] = val_paid
+
+                        data_incurred_to_one[
+                            r,
+                            j + 1
+                        ] = (
+                            base_val_inc
+                            * cl_ij_inc
+                        )
+
+                        data_paid_copy[
+                            r,
+                            j + 1
+                        ] = val_paid
+
+                    if (
+                        r == mm - j - 1
+                        and j < mm
+                    ):
+
+                        if (
+                            dev_con
+                            - 2 * std_con
+                            <= cl_ij_inc
+                            <= dev_con
+                            + 2 * std_con
+                        ):
+
+                            wagi_modified[
+                                r,
+                                j
+                            ] = 1
+
+                            data_wagi_pi_modified[
+                                r,
+                                j + 1
+                            ] = 1
+
+                        elif (
+                            (
+                                dev_con
+                                - 3 * std_con
+                                <= cl_ij_inc
+                                < dev_con
+                                - 2 * std_con
+                            )
+                            or
+                            (
+                                dev_con
+                                + 2 * std_con
+                                < cl_ij_inc
+                                <= dev_con
+                                + 3 * std_con
+                            )
+                        ):
+
+                            wagi_modified[
+                                r,
+                                j
+                            ] = 0.5
+
+                            data_wagi_pi_modified[
+                                r,
+                                j + 1
+                            ] = 0.5
+
+                        else:
+
+                            wagi_modified[
+                                r,
+                                j
+                            ] = 0
+
+                            data_wagi_pi_modified[
+                                r,
+                                j + 1
+                            ] = 0
+
+            data_incurred_to_one[
+                1:,
+                n_cols_orig
+            ] = np.nan
+
+            data_paid_to_one[
+                1:,
+                n_cols_orig
+            ] = np.nan
+
+            dev_j = Dev_prem(
+                data_incurred_to_one,
+                wagi_modified
+            )
+
+            l_ij = elementwise_division(
+                data_incurred_to_one
+            )
+
+            sigma_all = calculate_sigma(
+                data_incurred_to_one,
+                l_ij,
+                wagi_modified,
+                dev_j
+            )
+
+            sd_sim = sigma_all[1]
+
+            dev_sel, ind_choode = (
+                choose_value_list(
+                    dev_j,
+                    wykluczenia,
+                    1,
+                    10
+                )
+            )
+
+            # -----------------------------------
+            # POPRAWKA DLA NUMBA
+            # oryginalnie:
+            # sd_sel = sd_sim[ind_choode]
+            # -----------------------------------
+
+            sd_sel = np.empty(
+                len(ind_choode),
+                dtype=np.float64
+            )
+
+            for kk in range(
+                len(ind_choode)
+            ):
+
+                sd_sel[kk] = (
+                    sd_sim[
+                        ind_choode[kk]
+                    ]
+                )
+
+            # wybieramy tylko sd > 0
+            liczba_dodatnich = 0
+
+            for kk in range(
+                len(sd_sel)
+            ):
+
+                if sd_sel[kk] > 0:
+                    liczba_dodatnich += 1
+
+            sd_sel_new = np.empty(
+                liczba_dodatnich,
+                dtype=np.float64
+            )
+
+            dev_sel_new = np.empty(
+                liczba_dodatnich,
+                dtype=np.float64
+            )
+
+            pos = 0
+
+            for kk in range(
+                len(sd_sel)
+            ):
+
+                if sd_sel[kk] > 0:
+
+                    sd_sel_new[pos] = (
+                        sd_sel[kk]
+                    )
+
+                    dev_sel_new[pos] = (
+                        dev_sel[kk]
+                    )
+
+                    pos += 1
+
+            sd_sel = sd_sel_new
+            dev_sel = dev_sel_new
+
+            x_k = ind_choode + 1
+
+            a_coef, b_coef = (
+                fit_curve_factor_cl(
+                    dev_sel,
+                    sd_sel,
+                    x_k
+                )
+            )
+
+            total_f_len = (
+                len(dev_j)
+                + il_ogon
+            )
+
+            if Poz_CL - 1 > 0:
+
+                vec_f = np.empty(
+                    total_f_len - 1
+                )
+
+                vec_f[
+                    :(Poz_CL - 1)
+                ] = (
+                    dev_j[
+                        1:Poz_CL
+                    ]
+                )
+
+                vec_f[
+                    (Poz_CL - 1):
+                ] = (
+                    wspolczynnik_reg_factor_cl(
+                        a_coef,
+                        b_coef,
+                        Poz_CL + 1,
+                        total_f_len
+                    )
+                )
+
+            else:
+
+                vec_f = (
+                    wspolczynnik_reg_factor_cl(
+                        a_coef,
+                        b_coef,
+                        2,
+                        total_f_len - 1
+                    )
+                )
+
+            data_paid_to_one_new = (
+                data_paid_to_one[
+                    :,
+                    1:
+                ]
+            )
+
+            data_incurred_to_one_new = (
+                data_incurred_to_one[
+                    :,
+                    1:(n_cols_orig + 1)
+                ]
+            )
+
+            # vec_f[8:] = 1
+
+            tri_proj_tmp = (
+                triangle_forward_one_np(
+                    data_incurred_to_one_new,
+                    vec_f,
+                    1
+                )
+            )
+
+            ###############################################################
+
+            mm, nn = (
+                data_paid_to_one_new.shape
+            )
+
+            for jjj in range(
+                0,
+                nn
+            ):
+
+                licznik = 0.0
+                mianownik = 0.0
+
+                max_ind_row_rj = max(
+                    0,
+                    mm - jjj
+                )
+
+                for iii in range(
+                    0,
+                    mm
+                ):
+
+                    if (
+                        data_wagi_pi_modified[
+                            iii,
+                            jjj
+                        ] != 0
+                        and
+                        not np.isnan(
+                            data_wagi_pi_modified[
+                                iii,
+                                jjj
+                            ]
+                        )
+                    ):
+
+                        licznik = (
+                            licznik
+                            +
+                            data_wagi_pi_modified[
+                                iii,
+                                jjj
+                            ]
+                            *
+                            data_paid_to_one[
+                                iii,
+                                jjj
+                            ]
+                        )
+
+                        mianownik = (
+                            mianownik
+                            +
+                            data_wagi_pi_modified[
+                                iii,
+                                jjj
+                            ]
+                            *
+                            data_incurred_to_one[
+                                iii,
+                                jjj
+                            ]
+                        )
+
+                if mianownik == 0:
+
+                    r_j_sim[
+                        batch * batch_sim + i,
+                        jjj
+                    ] = 1
+
+                else:
+
+                    r_j_sim[
+                        batch * batch_sim + i,
+                        jjj
+                    ] = (
+                        licznik
+                        / mianownik
+                    )
+
+            #################### koniec jednoroczne
+
+            u_i = (
+                data_incurred_to_paid_copy[
+                    :,
+                    data_incurred_to_paid_copy.shape[1]
+                    - 1
+                ]
+            )
+
+            results[
+                batch * batch_sim + i,
+                0
+            ] = np.sum(u_i)
+
+            all_incurred_triangles[
+                batch * batch_sim + i
+            ] = tri_proj_tmp
+
+            all_paid_triangles[
+                batch * batch_sim + i
+            ] = data_paid_copy
+
+    for i in range(
+        1,
+        n_cols_orig
+    ):
+
+        suma = 0.0
+
+        for j in range(
+            sim_total
+        ):
+
+            suma += r_j_sim[
+                j,
+                i
+            ]
+
+        r_j_sim_mean[i] = (
+            suma
+            / sim_total
+        )
+
+    r_j_sim_mean[0] = rj[0]
+
+    rj_choose, ind_choose = (
+        choose_value_list(
+            r_j_sim_mean,
+            wykluczenia_p_i,
+            0,
+            1
+        )
+    )
+
+    a_num, b_num = (
+        fit_curve_factor_P_to_I(
+            rj_choose,
+            ind_choose + 1
+        )
+    )
+
+    if Poz_CL_p_i - 1 > 0:
+
+        vec_p_i = np.empty(
+            total_f_len - 1
+        )
+
+        vec_p_i[
+            :Poz_CL_p_i
+        ] = (
+            r_j_sim_mean[
+                :Poz_CL_p_i
+            ]
+        )
+
+        vec_p_i[
+            Poz_CL_p_i:
+        ] = (
+            wspolczynnik_reg_factor_P_to_I(
+                float(a_num),
+                float(b_num),
+                Poz_CL_p_i + 1,
+                total_f_len - 1
+            )
+        )
+
+    else:
+
+        vec_p_i = (
+            wspolczynnik_reg_factor_P_to_I(
+                float(a_num),
+                float(b_num),
+                1,
+                total_f_len - 1
+            )
+        )
+
+    # vec_p_i[12:] = 1
+    # print(vec_p_i)
+
+    for trian_sim_num in range(
+        all_incurred_triangles.shape[0]
+    ):
+
+        trian_sim = (
+            all_incurred_triangles[
+                trian_sim_num,
+                :,
+                :
+            ]
+        )
+
+        trian_sim_paid_one = (
+            all_paid_triangles[
+                trian_sim_num,
+                :,
+                1:
+            ]
+        )
+
+        for j_col in range(
+            1,
+            trian_sim_paid_one.shape[1]
+        ):
+
+            max_ind_row = max(
+                0,
+                trian_sim_paid_one.shape[0]
+                - j_col
+            )
+
+            for i in range(
+                max_ind_row,
+                trian_sim.shape[0]
+            ):
+
+                trian_sim_paid_one[
+                    i,
+                    j_col
+                ] = (
+                    trian_sim[
+                        i,
+                        j_col
+                    ]
+                    *
+                    vec_p_i[
+                        j_col + 1
+                    ]
+                )
+
+        cols_tmp = (
+            trian_sim_paid_one.shape[1]
+        )
+
+        tri_proj = np.empty(
+            (
+                mm,
+                cols_tmp + 1
+            )
+        )
+
+        tri_proj[
+            :,
+            0
+        ] = (
+            data_incurred_to_paid_copy[
+                :,
+                0
+            ]
+        )
+
+        for r in range(mm):
+
+            for c in range(
+                cols_tmp
+            ):
+
+                tri_proj[
+                    r,
+                    c + 1
+                ] = (
+                    trian_sim_paid_one[
+                        r,
+                        c
+                    ]
+                )
+
+        inc_proj = (
+            tri_proj[:, 1:]
+            -
+            tri_proj[:, :-1]
+        )
+
+        inc_disc = np.empty_like(
+            tri_proj
+        )
+
+        inc_disc[:, 0] = (
+            tri_proj[:, 0]
+        )
+
+        for r in range(mm):
+
+            for c in range(
+                1,
+                tri_proj.shape[1]
+            ):
+
+                inc_disc[
+                    r,
+                    c
+                ] = (
+                    inc_proj[
+                        r,
+                        c - 1
+                    ]
+                )
+
+        for rr in range(
+            mm - 1,
+            -1,
+            -1
+        ):
+
+            offset = (
+                mm - 1 - rr
+            )
+
+            for cc in range(
+                offset + 1,
+                tri_proj.shape[1]
+            ):
+
+                idx = (
+                    cc
+                    -
+                    (
+                        offset + 1
+                    )
+                )
+
+                if idx < len(
+                    discount_factors
+                ):
+
+                    inc_disc[
+                        rr,
+                        cc
+                    ] /= (
+                        discount_factors[
+                            idx
+                        ]
+                    )
+
+        cum_disc = (
+            inc_disc.copy()
+        )
+
+        for r in range(mm):
+
+            for c in range(
+                1,
+                tri_proj.shape[1]
+            ):
+
+                cum_disc[
+                    r,
+                    c
+                ] += (
+                    cum_disc[
+                        r,
+                        c - 1
+                    ]
+                )
+
+        cum_disc_ost = (
+            cum_disc[:, -1]
+        )
+
+        ult_gross_disc = np.sum(
+            cum_disc[:, -1]
+        )
+
+        ult_net_disc = 0.0
+
+        for iii in range(
+            len(latest)
+        ):
+
+            ult_net_disc += (
+                latest[iii]
+                +
+                (
+                    cum_disc_ost[iii]
+                    -
+                    latest[iii]
+                )
+                *
+                net_to_gross[iii]
+            )
+
+        results[
+            trian_sim_num,
+            1
+        ] = ult_gross_disc
+
+        results[
+            trian_sim_num,
+            2
+        ] = ult_net_disc
+
+    return results
+
+
+class ClincSimulator:
+
+    def run_simulation_clinc(self, dev_inc, sigma_inc, sd_inc,
+                         rj, varj,r_i_j, lambda_cor, data_paid_np, data_inc_np,weights_np, wykluczenia,
+                         Poz_CL,  data_wagi_pi,  wykluczenia_p_i,
+                         Poz_CL_p_i,dop_ogo_p_i,
+                         il_ogon,discount_factors,net_to_gross,
+             sim_total=1, batch_sim=1, main_seed=202260011,
+             sigma_inc_LR=None, dev_inc_LR=None, sd_inc_LR=None,
+             e_values=None, wagi_trimmed_LR=None,
+             ilosc_dop_wsp_LR=None, Poz_LR=0, il_ogon_LR=0,
+             k_zmiana=0):
+
+        # Backward compatible defaults: old CL callers can ignore LR args.
+        if sigma_inc_LR is None:
+            sigma_inc_LR = np.empty(0, dtype=np.float64)
+        else:
+            sigma_inc_LR = np.asarray(sigma_inc_LR, dtype=np.float64)
+
+        if dev_inc_LR is None:
+            dev_inc_LR = np.empty(0, dtype=np.float64)
+        else:
+            dev_inc_LR = np.asarray(dev_inc_LR, dtype=np.float64)
+
+        if sd_inc_LR is None:
+            sd_inc_LR = np.empty(0, dtype=np.float64)
+        else:
+            sd_inc_LR = np.asarray(sd_inc_LR, dtype=np.float64)
+
+        if e_values is None:
+            e_values = np.empty(0, dtype=np.float64)
+        else:
+            e_values = np.asarray(e_values, dtype=np.float64)
+
+        if wagi_trimmed_LR is None:
+            wagi_trimmed_LR = np.empty((0, 0), dtype=np.float64)
+        else:
+            wagi_trimmed_LR = np.asarray(wagi_trimmed_LR, dtype=np.float64)
+
+        if ilosc_dop_wsp_LR is None:
+            ilosc_dop_wsp_LR = np.empty(0, dtype=np.int32)
+        else:
+            ilosc_dop_wsp_LR = np.asarray(ilosc_dop_wsp_LR, dtype=np.int32)
+
+
+
+        results_incurred = run_simulation_cl_numba_incurred(
+            dev_inc,
+            sigma_inc,
+            sd_inc,
+            rj,
+            varj,
+            r_i_j,
+            lambda_cor,
+            data_paid_np,
+            data_inc_np,
+            weights_np,
+            wykluczenia,
+            Poz_CL,
+            data_wagi_pi,
+            wykluczenia_p_i,
+            Poz_CL_p_i,
+            dop_ogo_p_i,
+            il_ogon,
+            discount_factors,
+            net_to_gross,
+            sim_total,
+            batch_sim,
+            main_seed
+        )
+
+
+       # return run_simulation_cl_numba_incurred( dev_inc, sigma_inc, sd_inc,
+       #                  rj, varj,r_i_j, lambda_cor, data_paid_np, data_inc_np,weights_np, wykluczenia,
+       #                  Poz_CL,  data_wagi_pi,  wykluczenia_p_i,
+        #                 Poz_CL_p_i,dop_ogo_p_i,
+       #                  il_ogon,discount_factors,net_to_gross,
+        #     sigma_inc_LR, dev_inc_LR, sd_inc_LR,
+        #     e_values, wagi_trimmed_LR, ilosc_dop_wsp_LR,
+         #    Poz_LR, il_ogon_LR, k_zmiana,
+         #                sim_total, batch_sim, main_seed)
+        return results_incurred
