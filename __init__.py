@@ -6,8 +6,8 @@ def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
 
     n_rows, n_cols = l_ij.shape
 
-    sigmas = np.empty(n_cols)
-    sds = np.empty(n_cols)
+    sigmas = np.empty(n_cols, dtype=np.float64)
+    sds = np.empty(n_cols, dtype=np.float64)
 
     for j in range(n_cols):
 
@@ -24,7 +24,13 @@ def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
             p = p_ij[i, j]
             l = l_ij[i, j]
 
-            if not np.isnan(w):
+            if (
+                np.isfinite(w)
+                and np.isfinite(p)
+                and np.isfinite(l)
+                and w > 0.0
+                and p > 0.0
+            ):
 
                 diff = l - dev
 
@@ -33,63 +39,61 @@ def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
                 den_sd += w * p
                 cnt += 1
 
-        # Oryginalny wzór na sigma
-        if den > 1.0 and num > 0:
+        # =====================================
+        # 1. ESTYMACJA WARIANCJI
+        # =====================================
+
+        if cnt >= 3 and den > 1.0:
+
             sigma = num / (den - 1.0)
+
+        # =====================================
+        # 2. EKSTRAPOLACJA WARIANCJI
+        # =====================================
+
+        elif j >= 2:
+
+            sigma_1 = sigmas[j - 1]
+            sigma_2 = sigmas[j - 2]
+
+            if sigma_1 > 0.0 and sigma_2 > 0.0:
+
+                sigma = min(
+                    sigma_1 ** 2 / sigma_2,
+                    sigma_1,
+                    sigma_2
+                )
+
+            elif sigma_1 > 0.0:
+
+                sigma = sigma_1
+
+            elif sigma_2 > 0.0:
+
+                sigma = sigma_2
+
+            else:
+
+                sigma = 0.0
+
         else:
+
             sigma = 0.0
 
-        # Oryginalny wzór na SD
-        sd_val = sigma / den_sd if den_sd > 0.0 else 0.0
+        # =====================================
+        # 3. ODCHYLENIE STANDARDOWE
+        # =====================================
+
+        if den_sd > 0.0:
+
+            sd_val = sigma / den_sd
+            sd = np.sqrt(max(sd_val, 0.0))
+
+        else:
+
+            sd = 0.0
 
         sigmas[j] = sigma
-        sds[j] = np.sqrt(sd_val)
-
-        # Diagnostyka wszystkich okresów
-        print("-----------------------------")
-        print("j =", j)
-        print("dev =", dev)
-        print("num =", num)
-        print("den =", den)
-        print("den_sd =", den_sd)
-        print("cnt =", cnt)
-        print("sigma =", sigma)
-        print("sd =", sds[j])
-
-    # Znajdź okres z najmniejszym SD
-    min_j = 0
-    min_sd = sds[0]
-
-    for j in range(1, n_cols):
-        if sds[j] < min_sd:
-            min_sd = sds[j]
-            min_j = j
-
-    print("===================================")
-    print("NAJMNIEJSZE ODCHYLENIE")
-    print("j =", min_j)
-    print("dev =", dev_j[min_j])
-    print("sd =", min_sd)
-    print("===================================")
-
-    # Szczegółowa diagnostyka najmniejszego SD
-    for i in range(n_rows):
-
-        w = w_ij[i, min_j]
-        p = p_ij[i, min_j]
-        l = l_ij[i, min_j]
-
-        if not np.isnan(w) and w > 0:
-
-            diff = l - dev_j[min_j]
-
-            print(
-                "i =", i,
-                "p =", p,
-                "l =", l,
-                "w =", w,
-                "diff =", diff,
-                "skladnik_num =", w * p * diff * diff
-            )
+        sds[j] = sd
 
     return sigmas, sds
