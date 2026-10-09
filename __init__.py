@@ -1,5 +1,5 @@
-from numba import njit
 import numpy as np
+from numba import njit
 
 @njit
 def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
@@ -18,13 +18,6 @@ def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
         den_sd = 0.0
         cnt = 0
 
-        # Diagnostyka siódmego okresu
-        if j == 6:
-            print("================================")
-            print("DIAGNOSTYKA DLA j = 6")
-            print("Development factor:", dev)
-            print("================================")
-
         for i in range(n_rows):
 
             w = w_ij[i, j]
@@ -40,35 +33,63 @@ def calculate_sigma(p_ij, l_ij, w_ij, dev_j):
                 den_sd += w * p
                 cnt += 1
 
-                if j == 6:
-                    print(
-                        "i =", i,
-                        "p =", p,
-                        "l =", l,
-                        "w =", w,
-                        "diff =", diff
-                    )
-
+        # Oryginalny wzór na sigma
         if den > 1.0 and num > 0:
             sigma = num / (den - 1.0)
         else:
             sigma = 0.0
 
+        # Oryginalny wzór na SD
         sd_val = sigma / den_sd if den_sd > 0.0 else 0.0
 
         sigmas[j] = sigma
         sds[j] = np.sqrt(sd_val)
 
-        if j == 6:
-            print("================================")
-            print("PODSUMOWANIE j = 6")
-            print("Liczba obserwacji:", cnt)
-            print("num:", num)
-            print("den:", den)
-            print("den_sd:", den_sd)
-            print("sigma:", sigma)
-            print("sd_val:", sd_val)
-            print("sd:", sds[j])
-            print("================================")
+        # Diagnostyka wszystkich okresów
+        print("-----------------------------")
+        print("j =", j)
+        print("dev =", dev)
+        print("num =", num)
+        print("den =", den)
+        print("den_sd =", den_sd)
+        print("cnt =", cnt)
+        print("sigma =", sigma)
+        print("sd =", sds[j])
+
+    # Znajdź okres z najmniejszym SD
+    min_j = 0
+    min_sd = sds[0]
+
+    for j in range(1, n_cols):
+        if sds[j] < min_sd:
+            min_sd = sds[j]
+            min_j = j
+
+    print("===================================")
+    print("NAJMNIEJSZE ODCHYLENIE")
+    print("j =", min_j)
+    print("dev =", dev_j[min_j])
+    print("sd =", min_sd)
+    print("===================================")
+
+    # Szczegółowa diagnostyka najmniejszego SD
+    for i in range(n_rows):
+
+        w = w_ij[i, min_j]
+        p = p_ij[i, min_j]
+        l = l_ij[i, min_j]
+
+        if not np.isnan(w) and w > 0:
+
+            diff = l - dev_j[min_j]
+
+            print(
+                "i =", i,
+                "p =", p,
+                "l =", l,
+                "w =", w,
+                "diff =", diff,
+                "skladnik_num =", w * p * diff * diff
+            )
 
     return sigmas, sds
