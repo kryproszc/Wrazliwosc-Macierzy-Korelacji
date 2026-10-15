@@ -1,6 +1,9 @@
-mu_sev <- fitted(model_sev, what = "mu")
-sigma_sev <- fitted(model_sev, what = "sigma")
+wyniki_sev <- unique(
+  sev[, c("r", "i", "Y_model")]
+)
 
-sev$Y_model <- exp(mu_sev + sigma_sev^2 / 2)
+wyniki_sev <- wyniki_sev[
+  order(wyniki_sev$r, wyniki_sev$i),
+]
 
-head(sev[, c("r", "i", "Y", "Y_model")], 10)
+print(wyniki_sev, n = 52, digits = 12)
