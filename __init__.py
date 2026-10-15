@@ -1,19 +1,10 @@
 library(gamlss)
 
-freq <- subset(
-  frequency_data,
-  i >= start_year & i <= end_year
+model_poisson <- gamlss(
+  N ~ i + j,
+  family = PO(),
+  data = freq,
+  trace = FALSE
 )
 
-# Podstawowe informacje o danych
-str(freq)
-summary(freq)
-
-# Liczba obserwacji
-nrow(freq)
-
-# Kontrola wartości brakujących
-colSums(is.na(freq[, c("i", "j", "N")]))
-
-# Kontrola liczby roszczeń
-table(freq$N)
+summary(model_poisson)
