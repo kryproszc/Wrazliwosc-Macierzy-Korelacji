@@ -1,4 +1,8 @@
-options(digits = 12)
+mu <- fitted(model_freq, what = "mu")
 
-coef(model_freq, what = "mu")
-coef(model_freq, what = "sigma")
+head(data.frame(
+  i = freq$i,
+  j = freq$j,
+  N = freq$N,
+  mu = mu
+), 5)
