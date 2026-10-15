@@ -10,3 +10,7 @@ model_sev <- gamlss(
 )
 
 summary(model_sev)
+options(digits = 12)
+
+coef(model_sev, what = "mu")
+coef(model_sev, what = "sigma")
