@@ -1,16 +1,13 @@
-library(gamlss)
-
-model_sev <- gamlss(
-  Y ~ factor(r) + cs(i, df = 1),
-  sigma.formula = ~ 1,
-  family = LOGNO(mu.link = "identity",
-                 sigma.link = "log"),
-  data = sev,
-  trace = FALSE
+sev <- subset(
+  severity_data,
+  i >= 1999 & i <= 2024
 )
 
-summary(model_sev)
-options(digits = 12)
+# Liczba obserwacji
+nrow(sev)
 
-coef(model_sev, what = "mu")
-coef(model_sev, what = "sigma")
+# Liczba obserwacji według typu renty
+table(sev$r)
+
+# Podstawowe statystyki
+summary(sev)
