@@ -1,13 +1,6 @@
-sev <- subset(
-  severity_data,
-  i >= 1999 & i <= 2024
-)
+mu_sev <- fitted(model_sev, what = "mu")
+sigma_sev <- fitted(model_sev, what = "sigma")
 
-# Liczba obserwacji
-nrow(sev)
+sev$Y_model <- exp(mu_sev + sigma_sev^2 / 2)
 
-# Liczba obserwacji według typu renty
-table(sev$r)
-
-# Podstawowe statystyki
-summary(sev)
+head(sev[, c("r", "i", "Y", "Y_model")], 10)
