@@ -1,61 +1,111 @@
 
+library(gamlss)
+library(ggplot2)
 library(dplyr)
 
-# 1. Dane modelu dla roku 2000
-N_2000 <- 2.12024156745
+# ==========================================
+# 1. FREQUENCY - WPLYW ROKU SZKODY
+# ==========================================
 
-# 2. Severity według typu renty
-severity_2000 <- sev %>%
-  filter(i == 2000) %>%
-  group_by(r) %>%
-  summarise(
-    Y_expected = first(Y_model),
-    .groups = "drop"
-  )
-
-# 3. Rozpisanie wszystkich składników wzoru (10)
-BE_skladniki_2000 <- weights_data %>%
-  filter(i == 2000, m == 1) %>%
-  left_join(
-    ann_type_split,
-    by = "r"
-  ) %>%
-  left_join(
-    severity_2000,
-    by = "r"
-  ) %>%
-  mutate(
-    j = 26,
-    N_model = N_2000,
-    N_r = N_model * u,
-    annual_amount = N_r * Y_expected,
-    skladnik_BE = annual_amount * w
-  ) %>%
-  select(
-    i, j, r, l, m,
-    N_model, u, N_r,
-    Y_expected, annual_amount,
-    w, skladnik_BE
-  ) %>%
-  arrange(r, l)
-
-# 4. Wyświetlenie wszystkich 200 składników
-print(
-  as.data.frame(BE_skladniki_2000),
-  row.names = FALSE,
-  digits = 12
+freq_i <- data.frame(
+  i = 1999:2024,
+  j = rep(1, 26)
 )
 
-# 5. Kontrola sumowania
-BE_skladniki_2000 %>%
-  group_by(r) %>%
-  summarise(
-    liczba_wierszy = n(),
-    suma_w = sum(w),
-    BE = sum(skladnik_BE),
-    .groups = "drop"
-  ) %>%
-  print()
+freq_i$pred <- as.numeric(
+  predict(
+    model_freq,
+    newdata = freq_i,
+    what = "mu",
+    type = "response"
+  )
+)
 
-# 6. Łączne BE
-sum(BE_skladniki_2000$skladnik_BE)
+freq_i$ratio <- freq_i$pred / freq_i$pred[1]
+
+wykres_freq_i <- ggplot(freq_i, aes(i, ratio)) +
+  geom_line(color = "blue", linewidth = 1) +
+  labs(
+    title = "Zależność liczby zgłaszanych rent od roku szkody",
+    x = "i",
+    y = "Stosunek predykcji"
+  ) +
+  theme_bw()
+
+print(wykres_freq_i)
+
+
+# ==========================================
+# 2. FREQUENCY - WPLYW OKRESU ROZWOJU
+# ==========================================
+
+freq_j <- data.frame(
+  i = rep(1999, 26),
+  j = 1:26
+)
+
+freq_j$pred <- as.numeric(
+  predict(
+    model_freq,
+    newdata = freq_j,
+    what = "mu",
+    type = "response"
+  )
+)
+
+freq_j$ratio <- freq_j$pred / freq_j$pred[1]
+
+wykres_freq_j <- ggplot(freq_j, aes(j, ratio)) +
+  geom_line(color = "blue", linewidth = 1) +
+  labs(
+    title = "Zależność liczby zgłaszanych rent od roku rozwoju",
+    x = "j",
+    y = "Stosunek predykcji"
+  ) +
+  theme_bw()
+
+print(wykres_freq_j)
+
+
+# ==========================================
+# 3. SEVERITY - WPLYW ROKU SZKODY
+# ==========================================
+
+sev_i <- data.frame(
+  i = 1999:2024,
+  r = factor(
+    rep(1, 26),
+    levels = levels(factor(sev$r))
+  )
+)
+
+sev_i$mu <- as.numeric(
+  predict(
+    model_sev,
+    newdata = sev_i,
+    what = "mu",
+    type = "response"
+  )
+)
+
+# Sigma jest stala w naszym modelu
+sigma_sev <- exp(
+  as.numeric(coef(model_sev, what = "sigma")[1])
+)
+
+sev_i$pred <- exp(
+  sev_i$mu + sigma_sev^2 / 2
+)
+
+sev_i$ratio <- sev_i$pred / sev_i$pred[1]
+
+wykres_sev_i <- ggplot(sev_i, aes(i, ratio)) +
+  geom_line(color = "blue", linewidth = 1) +
+  labs(
+    title = "Zależność wysokości roszczenia rentowego od roku szkody",
+    x = "i",
+    y = "Stosunek predykcji"
+  ) +
+  theme_bw()
+
+print(wykres_sev_i)
