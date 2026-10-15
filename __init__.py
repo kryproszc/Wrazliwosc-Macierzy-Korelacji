@@ -1,9 +1,4 @@
-model_freq <- gamlss(
-  N ~ cs(i, df = 1) + cs(j, df = 11),
-  sigma.formula = ~ 1,
-  family = NBI(mu.link = "log", sigma.link = "log"),
-  data = freq,
-  trace = FALSE
-)
+options(digits = 12)
 
-summary(model_freq)
+coef(model_freq, what = "mu")
+coef(model_freq, what = "sigma")
