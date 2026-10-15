@@ -1,21 +1,11 @@
-library(dplyr)
-
-cashflows_test <- future_claims %>%
-  rename(m = l) %>%
-  inner_join(
-    weights_data,
-    by = c("r", "i", "m"),
-    relationship = "many-to-many"
-  ) %>%
-  mutate(
-    payment = annual_amount * w
-  )
-
-BEL_test <- cashflows_test %>%
-  group_by(i) %>%
+cashflows_test %>%
+  filter(i == 2000) %>%
+  group_by(r, m) %>%
   summarise(
-    be_undisc_mod = sum(payment),
+    liczba_wyplat = n(),
+    suma_w = sum(w),
+    annual_amount = first(annual_amount),
+    BE = sum(payment),
     .groups = "drop"
-  )
-
-print(as.data.frame(BEL_test), digits = 12)
+  ) %>%
+  print(n = Inf, width = Inf)
