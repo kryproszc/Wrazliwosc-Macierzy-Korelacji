@@ -1,14 +1,12 @@
-# Struktura danych
-str(severity_data)
+library(gamlss)
 
-# Podstawowe statystyki
-summary(severity_data)
+model_sev <- gamlss(
+  Y ~ factor(r) + cs(i, df = 1),
+  sigma.formula = ~ 1,
+  family = LOGNO(mu.link = "identity",
+                 sigma.link = "log"),
+  data = sev,
+  trace = FALSE
+)
 
-# Liczba obserwacji
-nrow(severity_data)
-
-# Liczba obserwacji według typu renty
-table(severity_data$r)
-
-# Brakujące wartości
-colSums(is.na(severity_data))
+summary(model_sev)
