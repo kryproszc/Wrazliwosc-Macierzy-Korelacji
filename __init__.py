@@ -1,59 +1,75 @@
 # ============================================================
-# PUNKT 7 – PROGNOZOWANIE PRZYSZŁYCH ZGŁOSZEŃ RENTOWYCH
-# Model Frequency – GAMLSS NBI
+# PUNKTY 8 i 9 – FREQUENCY × SEVERITY
 # ============================================================
 
-library(gamlss)
+# 1. Udziały typów rent
+u_data <- as.data.frame(ann_type_split[, c("r", "u")])
 
-# 1. Parametry
-start_year <- 1999
-end_year <- 2024
-a <- end_year - start_year + 1
-
-# 2. Utworzenie przyszłych komórek trójkąta
-future_freq <- expand.grid(
-  i = (start_year + 1):end_year,
-  j = 1:a
+stopifnot(
+  !anyNA(u_data),
+  !anyDuplicated(u_data$r),
+  abs(sum(u_data$u) - 1) < 1e-8
 )
 
-# 3. Wybór nieobserwowanych komórek
-future_freq <- subset(
+# 2. Przypisanie typów rent do przyszłych zgłoszeń
+future_rent <- merge(
   future_freq,
-  j >= end_year - i + 2
+  u_data,
+  by = NULL
 )
 
-# 4. Sortowanie
-future_freq <- future_freq[
-  order(future_freq$i, future_freq$j),
-]
+# 3. Oczekiwana liczba zgłoszeń danego typu
+future_rent$N_r <- future_rent$N_model * future_rent$u
 
-rownames(future_freq) <- NULL
+# 4. Prognoza parametrów Severity
+new_sev <- unique(future_rent[, c("r", "i")])
 
-# 5. Prognozowanie liczby zgłoszeń z GAMLSS
-future_freq$N_model <- predict(
-  model_freq,
-  newdata = future_freq,
-  data = freq,
+new_sev$mu <- predict(
+  model_sev,
+  newdata = new_sev,
+  data = sev,
   what = "mu",
   type = "response"
 )
 
-# 6. Wyniki
-options(digits = 12)
-
-print(head(future_freq, 20))
-
-cat("\nLiczba przyszłych komórek:",
-    nrow(future_freq), "\n")
-
-cat("Łączna oczekiwana liczba przyszłych zgłoszeń:",
-    sum(future_freq$N_model), "\n")
-
-# 7. Prognoza według roku szkody
-future_by_year <- aggregate(
-  N_model ~ i,
-  data = future_freq,
-  FUN = sum
+new_sev$sigma <- predict(
+  model_sev,
+  newdata = new_sev,
+  data = sev,
+  what = "sigma",
+  type = "response"
 )
 
-print(future_by_year)
+# 5. Średnia kwota roczna renty LOGNO
+new_sev$Y_model <- exp(
+  new_sev$mu + new_sev$sigma^2 / 2
+)
+
+# 6. Połączenie wyników
+future_rent <- merge(
+  future_rent,
+  new_sev[, c("r", "i", "Y_model")],
+  by = c("r", "i")
+)
+
+future_rent <- future_rent[
+  order(future_rent$i, future_rent$j, future_rent$r),
+]
+
+rownames(future_rent) <- NULL
+
+# 7. Oczekiwana roczna kwota roszczeń
+future_rent$annual_amount <- (
+  future_rent$N_r * future_rent$Y_model
+)
+
+# 8. Wyniki
+print(head(future_rent, 10))
+
+cat("\nLiczba wierszy:", nrow(future_rent))
+
+cat("\nOczekiwana liczba zgłoszeń:",
+    sum(future_rent$N_r))
+
+cat("\nSuma oczekiwanych rocznych kwot:",
+    sum(future_rent$annual_amount), "\n")
