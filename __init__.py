@@ -1,57 +1,116 @@
-# ==========================================
-# KONTROLA PARAMETRÓW GAMLSS
-# ==========================================
+library(dplyr)
+library(gamlss)
 
-options(digits = 16)
+valuation_year <- 2024
 
-# Frequency
-freq_mu <- coef(model_freq, what = "mu")
-freq_sigma <- coef(model_freq, what = "sigma")
+future_freq <- expand.grid(
+  i = 2000:2024,
+  j = 1:26
+) %>%
+  filter(i + j - 1 > valuation_year) %>%
+  arrange(i, j) %>%
+  as.data.frame()
 
-# Severity
-sev_mu <- coef(model_sev, what = "mu")
-sev_sigma <- coef(model_sev, what = "sigma")
+# Techniczna kolumna wymagana przez predict.gamlss
+future_freq$N <- 0
 
-# Porównanie z Excelem
-kontrola <- data.frame(
-  Model = c(rep("FREQ", 4), rep("SEV", 4)),
-
-  Parametr = c(
-    "mu_intercept",
-    "mu_i",
-    "mu_j",
-    "sigma_intercept",
-    "mu_intercept",
-    "mu_r2",
-    "mu_i",
-    "sigma_intercept"
-  ),
-
-  Excel = c(
-    198.7452407,
-    -0.096638495,
-    -0.200322656,
-    -2.778953213,
-    -17.10050039,
-    0.426104671,
-    0.012875203,
-    0.176668086
-  ),
-
-  R = c(
-    unname(freq_mu),
-    unname(freq_sigma),
-    unname(sev_mu),
-    unname(sev_sigma)
+future_freq$N_model <- as.numeric(
+  predict(
+    model_freq,
+    newdata = future_freq,
+    data = as.data.frame(freq[, c("i", "j", "N")]),
+    what = "mu",
+    type = "response"
   )
 )
 
-kontrola$Roznica <- kontrola$R - kontrola$Excel
-
-kontrola$Zgodnosc <- ifelse(
-  abs(kontrola$Roznica) < 1e-8,
-  "OK",
-  "ROZNICA"
+# Numer przyszłego okresu zgłoszenia
+future_freq$l <- with(
+  future_freq,
+  i + j - 1 - valuation_year
 )
 
-print(kontrola, row.names = FALSE, digits = 12)
+stopifnot(
+  !anyNA(future_freq$N_model),
+  all(is.finite(future_freq$N_model)),
+  all(future_freq$N_model >= 0)
+)
+
+head(future_freq, 10)
+
+sev_expected <- sev %>%
+  group_by(r, i) %>%
+  summarise(
+    Y_expected = mean(Y_model),
+    .groups = "drop"
+  )
+
+future_claims <- future_freq %>%
+  select(i, j, l, N_model) %>%
+  tidyr::crossing(r = unique(ann_type_split$r)) %>%
+  left_join(
+    as.data.frame(ann_type_split),
+    by = "r"
+  ) %>%
+  left_join(
+    sev_expected,
+    by = c("r", "i")
+  ) %>%
+  mutate(
+    N_r = N_model * u,
+    annual_amount = N_r * Y_expected
+  )
+
+stopifnot(
+  !anyNA(future_claims$annual_amount),
+  all(is.finite(future_claims$annual_amount))
+)
+
+head(future_claims, 10)
+
+
+weights_data %>%
+  summarise(
+    liczba_wierszy = n(),
+    min_l = min(l),
+    max_l = max(l),
+    min_m = min(m),
+    max_m = max(m),
+    udzial_m_ge_l = mean(m >= l)
+  )
+
+
+cashflows <- future_claims %>%
+  inner_join(
+    as.data.frame(weights_data),
+    by = c("r", "i", "l"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(m >= l) %>%
+  left_join(
+    as.data.frame(discount_factors) %>%
+      rename(m = l, discount = d),
+    by = "m"
+  )
+
+stopifnot(
+  !anyNA(cashflows$discount),
+  !anyNA(cashflows$w)
+)
+
+cashflows <- cashflows %>%
+  mutate(
+    payment_undisc = annual_amount * w,
+    payment_disc = payment_undisc * discount
+  )
+
+BEL_model <- cashflows %>%
+  group_by(i) %>%
+  summarise(
+    be_undisc_mod = sum(payment_undisc),
+    be_disc_mod = sum(payment_disc),
+    .groups = "drop"
+  )
+
+print(as.data.frame(BEL_model), digits = 12)
+
