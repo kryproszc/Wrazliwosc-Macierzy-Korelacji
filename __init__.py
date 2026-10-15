@@ -1,10 +1,9 @@
-library(gamlss)
-
-model_poisson <- gamlss(
-  N ~ i + j,
-  family = PO(),
+model_freq <- gamlss(
+  N ~ cs(i, df = 1) + cs(j, df = 11),
+  sigma.formula = ~ 1,
+  family = NBI(mu.link = "log", sigma.link = "log"),
   data = freq,
   trace = FALSE
 )
 
-summary(model_poisson)
+summary(model_freq)
