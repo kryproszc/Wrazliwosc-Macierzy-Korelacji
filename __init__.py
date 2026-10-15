@@ -1,10 +1,7 @@
 weights_data %>%
-  filter(r == 1, i == 2000, m %in% c(1, 2, 3)) %>%
-  group_by(m) %>%
+  count(r, i, l, m) %>%
   summarise(
-    min_l = min(l),
-    max_l = max(l),
-    liczba = n(),
-    suma_w = sum(w),
-    .groups = "drop"
+    liczba_kombinacji = n(),
+    liczba_duplikatow = sum(n > 1),
+    max_powtorzen = max(n)
   )
