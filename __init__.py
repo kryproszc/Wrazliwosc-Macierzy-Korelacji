@@ -1,73 +1,61 @@
+
 library(dplyr)
 
-options(digits = 15, width = 200)
+# 1. Dane modelu dla roku 2000
+N_2000 <- 2.12024156745
 
-# 1. FREQUENCY - rok 2000
-cat("\n========== FREQUENCY ==========\n")
+# 2. Severity według typu renty
+severity_2000 <- sev %>%
+  filter(i == 2000) %>%
+  group_by(r) %>%
+  summarise(
+    Y_expected = first(Y_model),
+    .groups = "drop"
+  )
 
-print(as.data.frame(
-  freq %>%
-    filter(i == 2000, j >= 26) %>%
-    select(i, j, N_model)
-), row.names = FALSE)
+# 3. Rozpisanie wszystkich składników wzoru (10)
+BE_skladniki_2000 <- weights_data %>%
+  filter(i == 2000, m == 1) %>%
+  left_join(
+    ann_type_split,
+    by = "r"
+  ) %>%
+  left_join(
+    severity_2000,
+    by = "r"
+  ) %>%
+  mutate(
+    j = 26,
+    N_model = N_2000,
+    N_r = N_model * u,
+    annual_amount = N_r * Y_expected,
+    skladnik_BE = annual_amount * w
+  ) %>%
+  select(
+    i, j, r, l, m,
+    N_model, u, N_r,
+    Y_expected, annual_amount,
+    w, skladnik_BE
+  ) %>%
+  arrange(r, l)
 
+# 4. Wyświetlenie wszystkich 200 składników
+print(
+  as.data.frame(BE_skladniki_2000),
+  row.names = FALSE,
+  digits = 12
+)
 
-# 2. SEVERITY - rok 2000
-cat("\n========== SEVERITY ==========\n")
+# 5. Kontrola sumowania
+BE_skladniki_2000 %>%
+  group_by(r) %>%
+  summarise(
+    liczba_wierszy = n(),
+    suma_w = sum(w),
+    BE = sum(skladnik_BE),
+    .groups = "drop"
+  ) %>%
+  print()
 
-print(as.data.frame(
-  sev %>%
-    filter(i == 2000) %>%
-    select(r, i, Y_model)
-), row.names = FALSE)
-
-
-# 3. UDZIAŁY RENT
-cat("\n========== UDZIAŁY ==========\n")
-
-print(as.data.frame(u_data), row.names = FALSE)
-
-
-# 4. WAGI - struktura dla 2000 roku
-cat("\n========== WAGI ==========\n")
-
-print(as.data.frame(
-  w_data %>%
-    filter(i == 2000) %>%
-    group_by(r, m) %>%
-    summarise(
-      min_l = min(l),
-      max_l = max(l),
-      liczba = n(),
-      suma_w = sum(w),
-      suma_w_od_m = sum(w[l >= m]),
-      .groups = "drop"
-    )
-), row.names = FALSE)
-
-
-# 5. BE WEDŁUG TYPU RENTY
-cat("\n========== BE WEDŁUG TYPU ==========\n")
-
-print(as.data.frame(
-  wyliczenie_BEL_2000 %>%
-    group_by(r, m) %>%
-    summarise(
-      liczba = n(),
-      N_model = first(N_model),
-      u = first(u),
-      N_r = first(N_r),
-      Y_model = first(Y_model),
-      annual_amount = first(annual_amount),
-      suma_w = sum(w),
-      BE = sum(payment),
-      .groups = "drop"
-    )
-), row.names = FALSE)
-
-
-# 6. BE ŁĄCZNIE
-cat("\n========== BE ŁĄCZNIE ==========\n")
-
-print(sum(wyliczenie_BEL_2000$payment),
-      digits = 15)
+# 6. Łączne BE
+sum(BE_skladniki_2000$skladnik_BE)
