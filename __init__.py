@@ -1,9 +1,21 @@
-wyniki_sev <- unique(
-  sev[, c("r", "i", "Y_model")]
-)
+library(dplyr)
 
-wyniki_sev <- wyniki_sev[
-  order(wyniki_sev$r, wyniki_sev$i),
-]
+wyniki_sev <- sev %>%
+  group_by(r, i) %>%
+  summarise(
+    Y_model = mean(Y_model),
+    .groups = "drop"
+  )
 
-print(wyniki_sev, n = 52, digits = 12)
+print(as.data.frame(wyniki_sev), digits = 12)
+
+
+
+
+sev %>%
+  group_by(r, i) %>%
+  summarise(
+    rozstep = max(Y_model) - min(Y_model),
+    .groups = "drop"
+  ) %>%
+  summarise(max_rozstep = max(rozstep))
