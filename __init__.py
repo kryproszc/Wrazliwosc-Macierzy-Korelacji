@@ -1,36 +1,22 @@
 
 library(dplyr)
 
-# Jeden wiersz na kombinację roku, okresu zgłoszenia i typu renty
-fc_2000 <- future_claims %>%
-  filter(i == 2000) %>%
-  distinct(i, j, m, r, annual_amount)
+# Rok wyceny: 2024
+# j = 1 oznacza rok zajścia szkody
 
-# Łączenie z wszystkimi przyszłymi wypłatami
-kontrola_2000 <- fc_2000 %>%
-  inner_join(
-    weights_data %>% filter(i == 2000),
-    by = c("i", "r", "m" = "l")
-  ) %>%
+fq_2000 <- future_claims %>%
+  filter(i == 2000) %>%
   mutate(
-    skladnik_BE = if_else(
-      m.y >= m.x,
-      annual_amount * w,
-      0
-    )
+    okres_zgloszenia = i + j - 2024 - 1
+  ) %>%
+  distinct(
+    i, j, r, okres_zgloszenia,
+    annual_amount
   )
 
+print(as.data.frame(fq_2000), row.names = FALSE)
 
-
-
-
-library(dplyr)
-
-fc_2000 <- future_claims %>%
-  filter(i == 2000) %>%
-  distinct(i, j, m, r, annual_amount) %>%
-  rename(okres_zgloszenia = m)
-
+# Wagi zakładu: l = okres zgłoszenia, m = okres wypłaty
 w_2000 <- weights_data %>%
   filter(i == 2000) %>%
   transmute(
@@ -40,32 +26,42 @@ w_2000 <- weights_data %>%
     w
   )
 
-kontrola_2000 <- fc_2000 %>%
+# Łączenie według pierwszego wzoru (10)
+szczegoly_2000 <- fq_2000 %>%
   inner_join(
     w_2000,
     by = c("i", "r", "okres_zgloszenia")
   ) %>%
+  filter(okres_wyplaty >= okres_zgloszenia) %>%
   mutate(
-    skladnik_BE = if_else(
-      okres_wyplaty >= okres_zgloszenia,
-      annual_amount * w,
-      0
-    )
-  )
+    skladnik_BE = annual_amount * w
+  ) %>%
+  arrange(r, okres_zgloszenia, okres_wyplaty)
 
-wynik <- kontrola_2000 %>%
+# Kontrola szczegółowa
+print(
+  as.data.frame(head(szczegoly_2000, 10)),
+  row.names = FALSE,
+  digits = 15
+)
+
+# Wynik według rodzaju renty
+wynik_2000 <- szczegoly_2000 %>%
   group_by(r) %>%
   summarise(
     liczba_wierszy = n(),
-    min_wyplata = min(okres_wyplaty),
-    max_wyplata = max(okres_wyplaty),
-    suma_w = sum(w[okres_wyplaty >= okres_zgloszenia]),
+    suma_w = sum(w),
     BEL = sum(skladnik_BE),
     .groups = "drop"
   )
 
-print(as.data.frame(wynik),
+print(as.data.frame(wynik_2000),
       row.names = FALSE,
       digits = 15)
 
-cat("\nBEL 2000:", sum(wynik$BEL), "\n")
+cat(
+  "\nBEL 2000 =",
+  sum(wynik_2000$BEL),
+  "\n"
+)
+
