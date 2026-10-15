@@ -1,43 +1,73 @@
-options(digits = 12, width = 160)
+library(dplyr)
 
-cat("\n===== 1. FREQUENCY =====\n")
+options(digits = 15, width = 200)
+
+# 1. FREQUENCY - rok 2000
+cat("\n========== FREQUENCY ==========\n")
+
 print(as.data.frame(
-  future_claims %>%
-    filter(i == 2000) %>%
-    distinct(i, j, l, N_model)
+  freq %>%
+    filter(i == 2000, j >= 26) %>%
+    select(i, j, N_model)
 ), row.names = FALSE)
 
-cat("\n===== 2. SEVERITY I UDZIALY =====\n")
+
+# 2. SEVERITY - rok 2000
+cat("\n========== SEVERITY ==========\n")
+
 print(as.data.frame(
-  future_claims %>%
+  sev %>%
     filter(i == 2000) %>%
-    select(r, u, Y_expected, N_r, annual_amount)
+    select(r, i, Y_model)
 ), row.names = FALSE)
 
-cat("\n===== 3. SUMY WAG =====\n")
+
+# 3. UDZIAŁY RENT
+cat("\n========== UDZIAŁY ==========\n")
+
+print(as.data.frame(u_data), row.names = FALSE)
+
+
+# 4. WAGI - struktura dla 2000 roku
+cat("\n========== WAGI ==========\n")
+
 print(as.data.frame(
-  weights_data %>%
-    filter(i == 2000, m == 1) %>%
+  w_data %>%
+    filter(i == 2000) %>%
     group_by(r, m) %>%
     summarise(
+      min_l = min(l),
+      max_l = max(l),
       liczba = n(),
       suma_w = sum(w),
+      suma_w_od_m = sum(w[l >= m]),
       .groups = "drop"
     )
 ), row.names = FALSE)
 
-cat("\n===== 4. BE WEDLUG TYPU RENTY =====\n")
+
+# 5. BE WEDŁUG TYPU RENTY
+cat("\n========== BE WEDŁUG TYPU ==========\n")
+
 print(as.data.frame(
-  cashflows_test %>%
-    filter(i == 2000) %>%
-    group_by(r) %>%
+  wyliczenie_BEL_2000 %>%
+    group_by(r, m) %>%
     summarise(
+      liczba = n(),
+      N_model = first(N_model),
+      u = first(u),
+      N_r = first(N_r),
+      Y_model = first(Y_model),
+      annual_amount = first(annual_amount),
+      suma_w = sum(w),
       BE = sum(payment),
       .groups = "drop"
     )
 ), row.names = FALSE)
 
-cat("\n===== 5. BE LACZNIE =====\n")
-print(as.data.frame(
-  BEL_test %>% filter(i == 2000)
-), row.names = FALSE)
+
+# 6. BE ŁĄCZNIE
+cat("\n========== BE ŁĄCZNIE ==========\n")
+
+print(sum(wyliczenie_BEL_2000$payment),
+      digits = 15)
