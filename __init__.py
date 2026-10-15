@@ -1,8 +1,9 @@
-sev_r1 <- porownanie_sev %>%
-  filter(r == 1) %>%
-  arrange(i)
+library(dplyr)
 
-
-sev_r2 <- porownanie_sev %>%
-  filter(r == 2) %>%
-  arrange(i)
+porownanie_sev <- sev %>%
+  group_by(r, i) %>%
+  summarise(
+    Y_data  = mean(Y),
+    Y_model = mean(Y_model),
+    .groups = "drop"
+  )
