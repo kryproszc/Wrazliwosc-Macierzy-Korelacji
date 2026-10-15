@@ -1,181 +1,149 @@
-
-# ============================================================
-# PUNKTY 8 i 9 – FREQUENCY × SEVERITY
-# Model rezerw rentowych IBNYR
-# ============================================================
-
 library(gamlss)
+library(gamlss.dist)
+library(dplyr)
 
-# ------------------------------------------------------------
-# 1. Przygotowanie udziałów typów rent
-# ------------------------------------------------------------
+# =====================================================
+# 1. PRZYGOTOWANIE DANYCH
+# =====================================================
 
-u_data <- as.data.frame(ann_type_split[, c("r", "u")])
+start_year <- 1999
+end_year <- 2024
 
-# Zgodność typu zmiennej r z danymi Severity
-u_data$r <- as.numeric(as.character(u_data$r))
-u_data$u <- as.numeric(u_data$u)
+sev <- severity_data %>%
+  filter(i >= start_year, i <= end_year) %>%
+  select(r, i, Y) %>%
+  as.data.frame()
 
 # Kontrola danych
-stopifnot(
-  !anyNA(u_data),
-  !anyDuplicated(u_data$r),
-  all(u_data$u >= 0),
-  abs(sum(u_data$u) - 1) < 1e-8
+summary(sev)
+nrow(sev)
+table(sev$r)
+colSums(is.na(sev))
+
+
+# =====================================================
+# 2. ESTYMACJA MODELU GAMLSS - LOGNO
+# =====================================================
+
+model_sev <- gamlss(
+  Y ~ factor(r) + cs(i, df = 1),
+  sigma.formula = ~ 1,
+  family = LOGNO(
+    mu.link = "identity",
+    sigma.link = "log"
+  ),
+  data = sev,
+  trace = FALSE
 )
 
-# ------------------------------------------------------------
-# 2. Połączenie Frequency z typami rent
-# ------------------------------------------------------------
+# Wyniki estymacji
+summary(model_sev)
 
-future_rent <- merge(
-  as.data.frame(future_freq),
-  u_data,
-  by = NULL
-)
-
-# Oczekiwana liczba zgłoszeń dla danego typu renty
-future_rent$N_r <- future_rent$N_model * future_rent$u
-
-# ------------------------------------------------------------
-# 3. Przygotowanie danych do prognozy Severity
-# ------------------------------------------------------------
-
-new_sev <- unique(
-  future_rent[, c("r", "i")]
-)
-
-new_sev <- as.data.frame(new_sev)
-
-new_sev$r <- as.numeric(new_sev$r)
-new_sev$i <- as.numeric(new_sev$i)
-
-# ------------------------------------------------------------
-# 4. Predykcja parametrów rozkładu LOGNO
-# ------------------------------------------------------------
-
-new_sev$mu <- as.numeric(
-  predict(
-    model_sev,
-    newdata = new_sev,
-    data = sev,
-    what = "mu",
-    type = "response"
-  )
-)
-
-new_sev$sigma <- as.numeric(
-  predict(
-    model_sev,
-    newdata = new_sev,
-    data = sev,
-    what = "sigma",
-    type = "response"
-  )
-)
-
-# ------------------------------------------------------------
-# 5. Oczekiwana kwota roczna renty
-# Rozkład LOGNO
-# ------------------------------------------------------------
-
-new_sev$Y_model <- exp(
-  new_sev$mu + 0.5 * new_sev$sigma^2
-)
-
-# Kontrola prognoz
-stopifnot(
-  !anyNA(new_sev$Y_model),
-  all(is.finite(new_sev$Y_model)),
-  all(new_sev$Y_model > 0)
-)
-
-# ------------------------------------------------------------
-# 6. Połączenie prognoz Frequency i Severity
-# ------------------------------------------------------------
-
-future_rent <- merge(
-  future_rent,
-  new_sev[, c("r", "i", "Y_model")],
-  by = c("r", "i"),
-  all.x = TRUE,
-  sort = FALSE
-)
-
-future_rent <- future_rent[
-  order(future_rent$i, future_rent$j, future_rent$r),
-]
-
-rownames(future_rent) <- NULL
-
-# Kontrola kompletności
-stopifnot(
-  nrow(future_rent) == nrow(future_freq) * nrow(u_data),
-  !anyNA(future_rent$Y_model)
-)
-
-# ------------------------------------------------------------
-# 7. Oczekiwana roczna kwota roszczeń
-# ------------------------------------------------------------
-
-future_rent$annual_amount <- (
-  future_rent$N_r * future_rent$Y_model
-)
-
-# ------------------------------------------------------------
-# 8. Podsumowanie wyników
-# ------------------------------------------------------------
-
+# Współczynniki z pełną precyzją
 options(digits = 12)
 
-cat("\n====================================")
-cat("\nWYNIKI FREQUENCY × SEVERITY")
-cat("\n====================================\n")
+coef(model_sev, what = "mu")
+coef(model_sev, what = "sigma")
 
-cat("\nLiczba wierszy:",
-    nrow(future_rent), "\n")
 
-cat("\nOczekiwana liczba zgłoszeń:",
-    sum(future_rent$N_r), "\n")
+# =====================================================
+# 3. PARAMETRY ROZKŁADU LOGNORMALNEGO
+# =====================================================
 
-cat("\nSuma oczekiwanych rocznych kwot:",
-    sum(future_rent$annual_amount), "\n")
+sev$mu <- as.numeric(
+  fitted(model_sev, what = "mu")
+)
 
-cat("\nPierwsze 10 obserwacji:\n")
+sev$sigma <- as.numeric(
+  fitted(model_sev, what = "sigma")
+)
 
-print(
-  head(
-    future_rent[, c(
-      "i", "j", "r", "u",
-      "N_model", "N_r", "Y_model",
-      "annual_amount"
-    )],
-    10
+# =====================================================
+# 4. OCZEKIWANA ROCZNA KWOTA RENTY
+# =====================================================
+
+sev$Y_model <- exp(
+  sev$mu + sev$sigma^2 / 2
+)
+
+# Pierwsze 10 obserwacji
+head(sev, 10)
+
+
+# =====================================================
+# 5. PROGNOZY DLA 2 TYPÓW RENT I LAT 1999-2024
+# =====================================================
+
+wyniki_sev <- sev %>%
+  group_by(r, i) %>%
+  summarise(
+    mu = mean(mu),
+    sigma = mean(sigma),
+    Y_model = mean(Y_model),
+    .groups = "drop"
+  ) %>%
+  arrange(r, i)
+
+print(as.data.frame(wyniki_sev), digits = 12)
+
+
+# =====================================================
+# 6. PORÓWNANIE Z DANYMI RZECZYWISTYMI
+# =====================================================
+
+porownanie_sev <- sev %>%
+  group_by(r, i) %>%
+  summarise(
+    Y_data = mean(Y),
+    Y_model = mean(Y_model),
+    .groups = "drop"
   )
+
+sev_r1 <- porownanie_sev %>%
+  filter(r == 1) %>%
+  arrange(i)
+
+sev_r2 <- porownanie_sev %>%
+  filter(r == 2) %>%
+  arrange(i)
+
+
+# =====================================================
+# 7. WYKRES DIAGNOSTYCZNY GAMLSS
+# =====================================================
+
+plot(model_sev)
+
+
+# =====================================================
+# 8. WYKRES SEVERITY - TYP RENTY 1
+# =====================================================
+
+barplot(
+  t(as.matrix(sev_r1[, c("Y_model", "Y_data")])),
+  beside = TRUE,
+  names.arg = sev_r1$i,
+  col = c("steelblue", "darkorange"),
+  las = 2,
+  cex.names = 0.7,
+  legend.text = c("Y_model", "Y_data"),
+  main = "Severity - typ renty 1",
+  ylab = "Srednia roczna kwota renty"
 )
 
-# ------------------------------------------------------------
-# 9. Podsumowanie według typu renty
-# ------------------------------------------------------------
 
-wyniki_typ <- aggregate(
-  cbind(N_r, annual_amount) ~ r,
-  data = future_rent,
-  FUN = sum
+# =====================================================
+# 9. WYKRES SEVERITY - TYP RENTY 2
+# =====================================================
+
+barplot(
+  t(as.matrix(sev_r2[, c("Y_model", "Y_data")])),
+  beside = TRUE,
+  names.arg = sev_r2$i,
+  col = c("steelblue", "darkorange"),
+  las = 2,
+  cex.names = 0.7,
+  legend.text = c("Y_model", "Y_data"),
+  main = "Severity - typ renty 2",
+  ylab = "Srednia roczna kwota renty"
 )
-
-cat("\nWyniki według typu renty:\n")
-print(wyniki_typ)
-
-# ------------------------------------------------------------
-# 10. Podsumowanie według roku szkody
-# ------------------------------------------------------------
-
-wyniki_rok <- aggregate(
-  cbind(N_r, annual_amount) ~ i,
-  data = future_rent,
-  FUN = sum
-)
-
-cat("\nWyniki według roku szkody:\n")
-print(wyniki_rok)
