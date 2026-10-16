@@ -1,12 +1,9 @@
-diag_w <- aggregate(
-  w ~ r + m,
-  data = subset(wd, i == 2000),
+aggregate(
+  l ~ r + m,
+  data = subset(wd, i == 2000 & m <= 3),
   FUN = function(x) c(
-    liczba = length(x),
-    suma = sum(x),
     min = min(x),
-    max = max(x)
+    max = max(x),
+    liczba = length(x)
   )
 )
-
-print(head(diag_w, 12))
