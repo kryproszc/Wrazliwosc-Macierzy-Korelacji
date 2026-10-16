@@ -1,61 +1,148 @@
-rok <- 2000
-a <- 26
-i_num <- rok - 1999 + 1
 
-freq_rok <- subset(freq, i == rok & j >= a - i_num + 2)
-sev_rok <- subset(sev, i == rok)
-w_rok <- subset(wd, i == rok)
+# ==========================================
+# BEL - rezerwy rentowe IBNYR
+# Zdyskontowane i niezdyskontowane
+# ==========================================
 
-bel_disc <- 0
+policz_BEL <- function(freq, sev, ud, wd, disc_df,
+                       start_year = 1999,
+                       end_year = 2024,
+                       koszt = 0.018,
+                       narzut = 0.0963) {
 
-for (k in seq_len(nrow(freq_rok))) {
+  a <- end_year - start_year + 1
+  lata <- (start_year + 1):end_year
 
-  j <- freq_rok$j[k]
-  N <- freq_rok$N_model[k]
+  wymagane <- list(
+    freq = c("i", "j", "N_model"),
+    sev = c("i", "r", "Y_model"),
+    ud = c("r", "u"),
+    wd = c("i", "r", "l", "m", "w"),
+    disc_df = c("l", "d")
+  )
 
-  m <- j - (a - i_num + 1)
+  dane <- list(freq = freq, sev = sev, ud = ud,
+               wd = wd, disc_df = disc_df)
 
-  for (r0 in unique(ud$r)) {
-
-    u0 <- ud$u[ud$r == r0]
-    Y <- sev_rok$Y_model[sev_rok$r == r0]
-
-    ww <- subset(w_rok, r == r0 & m == !!m)
+  for (nazwa in names(wymagane)) {
+    brak <- setdiff(wymagane[[nazwa]], names(dane[[nazwa]]))
+    if (length(brak) > 0) {
+      stop(paste("Brak kolumn w", nazwa,
+                 paste(brak, collapse = ", ")))
+    }
   }
-}
 
+  wyniki <- data.frame()
 
-bel_disc <- 0
+  for (rok in lata) {
 
-for (k in seq_len(nrow(freq_rok))) {
+    i_num <- rok - start_year + 1
+    j_min <- a - i_num + 2
 
-  j0 <- freq_rok$j[k]
-  N <- freq_rok$N_model[k]
-  m0 <- j0 - (a - i_num + 1)
-
-  for (r0 in ud$r) {
-
-    u0 <- ud$u[ud$r == r0]
-    Y <- sev_rok$Y_model[sev_rok$r == r0]
-
-    ww <- w_rok[
-      w_rok$r == r0 &
-      w_rok$m == m0 &
-      w_rok$l >= m0,
+    freq_rok <- freq[
+      freq$i == rok &
+      freq$j >= j_min &
+      freq$j <= a, , drop = FALSE
     ]
 
-    idx <- match(ww$l, disc_df$l)
+    sev_rok <- sev[sev$i == rok, , drop = FALSE]
+    w_rok <- wd[wd$i == rok, , drop = FALSE]
 
-    if (anyNA(idx)) {
-      stop("Brakuje współczynników dyskontowych dla części okresów l")
+    bel_undisc <- 0
+    bel_disc <- 0
+
+    for (k in seq_len(nrow(freq_rok))) {
+
+      j0 <- freq_rok$j[k]
+      N <- freq_rok$N_model[k]
+
+      m0 <- j0 - (a - i_num + 1)
+
+      for (r0 in ud$r) {
+
+        u0 <- ud$u[ud$r == r0]
+        Y <- sev_rok$Y_model[sev_rok$r == r0]
+
+        if (length(u0) != 1 || length(Y) != 1 ||
+            anyNA(c(N, u0, Y))) {
+          stop(paste("Brak danych: rok", rok,
+                     "typ", r0))
+        }
+
+        ww <- w_rok[
+          w_rok$r == r0 &
+          w_rok$m == m0 &
+          w_rok$l >= m0, , drop = FALSE
+        ]
+
+        if (nrow(ww) == 0 || anyNA(ww$w)) {
+          stop(paste("Brak w: rok", rok,
+                     "typ", r0, "m =", m0))
+        }
+
+        # BE niezdyskontowane
+        suma_w <- sum(ww$w)
+
+        bel_undisc <- bel_undisc +
+          N * u0 * Y * suma_w
+
+        # BE zdyskontowane
+        idx <- match(ww$l, disc_df$l)
+
+        # Nie pomijamy brakujących okresów
+        # mających niezerową wypłatę
+        aktywne <- is.na(idx) & ww$w != 0
+
+        if (any(aktywne)) {
+          stop(paste(
+            "Brak dyskonta: rok", rok,
+            "typ", r0,
+            "okresy:",
+            paste(unique(ww$l[aktywne]),
+                  collapse = ", ")
+          ))
+        }
+
+        d_w <- rep(0, nrow(ww))
+        obecne <- !is.na(idx)
+        d_w[obecne] <- disc_df$d[idx[obecne]]
+
+        if (anyNA(d_w[ww$w != 0])) {
+          stop(paste("NA w dyskoncie: rok", rok))
+        }
+
+        suma_w_disc <- sum(ww$w * d_w)
+
+        bel_disc <- bel_disc +
+          N * u0 * Y * suma_w_disc
+      }
     }
 
-    suma_w_disc <- sum(ww$w * disc_df$d[idx])
+    # Koszty i narzut
+    wsp <- (1 + koszt) * (1 + narzut)
 
-    bel_disc <- bel_disc + N * u0 * Y * suma_w_disc
+    wyniki <- rbind(
+      wyniki,
+      data.frame(
+        rok = rok,
+        be_undisc_mod = bel_undisc * wsp,
+        be_disc_mod = bel_disc * wsp
+      )
+    )
   }
+
+  return(wyniki)
 }
 
-bel_disc <- bel_disc * 1.018 * 1.0963
+wyniki_BEL <- policz_BEL(
+  freq = freq,
+  sev = sev,
+  ud = ud,
+  wd = wd,
+  disc_df = disc_df
+)
 
-cat("BE disc 2000:", bel_disc, "\n")
+print(wyniki_BEL, row.names = FALSE, digits = 12)
+
+
+                             
