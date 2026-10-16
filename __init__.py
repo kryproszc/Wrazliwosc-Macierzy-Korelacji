@@ -1,57 +1,49 @@
 
 library(dplyr)
 
-# 1. Dane frequency i severity dla roku 2000
-fq_2000 <- future_claims %>%
+# 1. Okresy zgłoszenia wynikające z prognozy Frequency
+prognozy_2000 <- future_claims %>%
   filter(i == 2000) %>%
-  distinct(i, j, r, annual_amount) %>%
+  distinct(i, j, N_model) %>%
   mutate(
-    okres_zgloszenia = i + j - 2024 - 1
-  )
+    m_z_wzoru = i + j - 2025
+  ) %>%
+  arrange(j)
 
-# 2. Wagi z oryginalnego arkusza w
-w_2000 <- weights_data %>%
+cat("\n=== PROGNOZY ROKU 2000 ===\n")
+print(as.data.frame(prognozy_2000),
+      row.names = FALSE, digits = 15)
+
+
+# 2. Wszystkie okresy zgłoszenia dostępne w wagach
+wagi_2000 <- weights_data %>%
   filter(i == 2000) %>%
-  transmute(
-    i = i,
-    r = r,
-    okres_zgloszenia = m,
-    okres_wyplaty = l,
-    w = w
-  )
-
-# 3. Łączenie
-szczegoly_2000 <- fq_2000 %>%
-  inner_join(
-    w_2000,
-    by = c("i", "r", "okres_zgloszenia")
-  ) %>%
-  filter(okres_wyplaty >= okres_zgloszenia) %>%
-  mutate(
-    skladnik_BE = annual_amount * w
-  ) %>%
-  arrange(r, okres_wyplaty)
-
-# 4. Wyniki dla każdego typu renty
-wynik_2000 <- szczegoly_2000 %>%
-  group_by(r) %>%
+  group_by(r, m) %>%
   summarise(
-    liczba_wierszy = n(),
-    min_l = min(okres_wyplaty),
-    max_l = max(okres_wyplaty),
+    min_l = min(l),
+    max_l = max(l),
+    liczba_wag = n(),
     suma_w = sum(w),
-    BEL = sum(skladnik_BE),
     .groups = "drop"
+  ) %>%
+  arrange(r, m)
+
+cat("\n=== WAGI DLA ROKU 2000 ===\n")
+print(as.data.frame(wagi_2000),
+      row.names = FALSE, digits = 12)
+
+
+# 3. Które okresy m mają prognozę Frequency?
+kontrola_m <- wagi_2000 %>%
+  left_join(
+    prognozy_2000 %>%
+      distinct(m_z_wzoru, N_model),
+    by = c("m" = "m_z_wzoru")
+  ) %>%
+  mutate(
+    ma_prognoze = !is.na(N_model)
   )
 
-print(
-  as.data.frame(wynik_2000),
-  row.names = FALSE,
-  digits = 15
-)
-
-cat(
-  "\nBEL 2000 =",
-  sum(wynik_2000$BEL),
-  "\n"
-)
+cat("\n=== KONTROLA OKRESÓW m ===\n")
+print(as.data.frame(kontrola_m),
+      row.names = FALSE, digits = 12)
