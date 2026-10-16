@@ -1,5 +1,9 @@
-subset(
-  freq,
-  i %in% 1999:2002,
-  select = c(i, j, N_model)
+aggregate(
+  j ~ i,
+  data = freq,
+  FUN = function(x) c(
+    min = min(x),
+    max = max(x),
+    liczba = length(x)
+  )
 )
