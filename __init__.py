@@ -1,49 +1,70 @@
+library(readxl)
 
-library(dplyr)
+# Plik z wynikami modelu GAMLSS
+plik_model <- file.choose()
 
-# 1. Okresy zgłoszenia wynikające z prognozy Frequency
-prognozy_2000 <- future_claims %>%
-  filter(i == 2000) %>%
-  distinct(i, j, N_model) %>%
-  mutate(
-    m_z_wzoru = i + j - 2025
-  ) %>%
-  arrange(j)
+freq <- read_excel(plik_model, sheet = "FREQ_predictions")
+sev  <- read_excel(plik_model, sheet = "SEV_predictions")
 
-cat("\n=== PROGNOZY ROKU 2000 ===\n")
-print(as.data.frame(prognozy_2000),
-      row.names = FALSE, digits = 15)
+# Plik z danymi wejściowymi
+plik_dane <- file.choose()
 
+u <- read_excel(plik_dane, sheet = "u")
+w <- read_excel(plik_dane, sheet = "w")
 
-# 2. Wszystkie okresy zgłoszenia dostępne w wagach
-wagi_2000 <- weights_data %>%
-  filter(i == 2000) %>%
-  group_by(r, m) %>%
-  summarise(
-    min_l = min(l),
-    max_l = max(l),
-    liczba_wag = n(),
-    suma_w = sum(w),
-    .groups = "drop"
-  ) %>%
-  arrange(r, m)
-
-cat("\n=== WAGI DLA ROKU 2000 ===\n")
-print(as.data.frame(wagi_2000),
-      row.names = FALSE, digits = 12)
+# Sprawdzenie struktury
+head(freq)
+head(sev)
+head(u)
+head(w)
 
 
-# 3. Które okresy m mają prognozę Frequency?
-kontrola_m <- wagi_2000 %>%
-  left_join(
-    prognozy_2000 %>%
-      distinct(m_z_wzoru, N_model),
-    by = c("m" = "m_z_wzoru")
-  ) %>%
-  mutate(
-    ma_prognoze = !is.na(N_model)
-  )
+# Parametry
+rok <- 2000
+a <- 26
+i <- rok - 1999 + 1
 
-cat("\n=== KONTROLA OKRESÓW m ===\n")
-print(as.data.frame(kontrola_m),
-      row.names = FALSE, digits = 12)
+# Przyszłe okresy zgłoszeń
+j_start <- a - i + 2
+
+# Liczby zgłoszeń
+freq_rok <- subset(freq, i == rok & j >= j_start & j <= a)
+
+# Kwoty rocznych rent
+sev_rok <- subset(sev, i == rok)
+
+# Współczynniki wypłacalności
+w_rok <- subset(w, i == rok)
+
+# Obliczenie BE
+bel <- 0
+
+for (k in seq_len(nrow(freq_rok))) {
+
+  j <- freq_rok$j[k]
+  N <- freq_rok$N_model[k]
+
+  # Indeks okresu przyszłego zgłoszenia
+  m <- j - (a - i + 1)
+
+  for (r in sev_rok$r) {
+
+    Y <- sev_rok$Y_model[sev_rok$r == r]
+    udzial <- u$u[u$r == r]
+
+    # Hipoteza indeksowania:
+    # m = okres zgłoszenia, l = okres wypłaty
+    w_wybrane <- subset(
+      w_rok,
+      w_rok$r == r & w_rok$m == m & w_rok$l >= m
+    )
+
+    suma_w <- sum(w_wybrane$w)
+
+    bel <- bel + N * udzial * Y * suma_w
+  }
+}
+
+cat("BE 2000 - model:", bel, "\n")
+cat("BE 2000 - Excel:", 2274034.142, "\n")
+cat("Różnica:", bel - 2274034.142, "\n")
