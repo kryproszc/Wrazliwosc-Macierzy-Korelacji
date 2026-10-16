@@ -1,46 +1,27 @@
-
-import numpy as np
 import pandas as pd
-from mack import krzywa_ldf
+import numpy as np
 
-# Parametry Weibulla odtworzone z zakładu
+def wczytaj_dyskonto(plik, arkusz, hrg):
+    df = pd.read_excel(plik, sheet_name=arkusz)
 
-# 1. Surowe współczynniki Chain Ladder
-LDF_zaklad = np.array(fr, dtype=np.float64, copy=True)
+    df = df[
+        df["HRG"].astype(str).str.strip() == str(hrg).strip()
+    ].copy()
 
-# 2. Wygładzenie współczynników 4–21
-j_smooth = np.arange(4, 22, dtype=np.float64)
-
-LDF_zaklad[3:21] = krzywa_ldf(
-    j_smooth,
-    b0_zaklad,
-    b1_zaklad,
-    curve_type="weibull"
-)
-
-# 3. Tail z pięciu okresów: 22–26
-j_tail = np.arange(22, 27, dtype=np.float64)
-
-tail_zaklad = float(np.prod(
-    krzywa_ldf(
-        j_tail,
-        b0_zaklad,
-        b1_zaklad,
-        curve_type="weibull"
+    df["YEAR"] = pd.to_numeric(df["YEAR"])
+    df["RATE"] = pd.to_numeric(
+        df["RATE"].astype(str).str.replace(",", ".", regex=False)
     )
-))
 
-#from mack import calculate_paid_fit
+    df = df.sort_values("YEAR")
 
-paid_fit_zaklad, BEL_zaklad = calculate_paid_fit(
-    triangle=triangle,
-    ldf=LDF_zaklad,
-    tail=tail_zaklad,
-    inflacja=inflacja,
-    start_year=2003
+    return df[["YEAR", "RATE"]].to_numpy(dtype=float)
+
+
+discount_factors = wczytaj_dyskonto(
+    plik=plik,
+    arkusz="discount",
+    hrg=2
 )
 
-print("Wymiary trójkąta:", paid_fit_zaklad.shape)
-print(f"BEL = {BEL_zaklad:,.2f}")
-
-
+print(discount_factors)
