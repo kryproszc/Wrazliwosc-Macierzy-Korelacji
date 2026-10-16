@@ -73,4 +73,62 @@ print(f"b1 = {b1:.15f}")
 
 
 
+lista, paid_df, paid_np = wczytaj_trojkat(
+    plik=plik,
+    arkusz="paid_indexed",
+    hrg=10,
+    cumulative=False
+)
+
+print(lista)
+display(paid_df)
+
+
+import pandas as pd
+import numpy as np
+
+def wczytaj_trojkat(plik, arkusz, hrg, cumulative=False):
+    # Wczytanie danych
+    df = pd.read_excel(plik, sheet_name=arkusz)
+
+    # Wybór HRG
+    df = df[df["HRG"].astype(str).str.strip() == str(hrg).strip()].copy()
+
+    if df.empty:
+        raise ValueError(f"Brak danych dla HRG = {hrg}")
+
+    # Konwersja danych
+    df["VENT_YEAR"] = pd.to_numeric(df["VENT_YEAR"])
+    df["DEV_YEAR"] = pd.to_numeric(df["DEV_YEAR"])
+    df["AMOUNT"] = pd.to_numeric(
+        df["AMOUNT"].astype(str).str.replace(",", ".", regex=False)
+    )
+
+    # Budowa trójkąta
+    trojkat = df.pivot_table(
+        index="VENT_YEAR",
+        columns="DEV_YEAR",
+        values="AMOUNT",
+        aggfunc="sum"
+    )
+
+    # Uporządkowanie kolumn
+    trojkat = trojkat.sort_index().sort_index(axis=1)
+
+    # Opcjonalna kumulacja
+    if cumulative:
+        trojkat = trojkat.cumsum(axis=1)
+
+    # Lista list (bez wartości NaN na końcach wierszy)
+    lista = [
+        row.dropna().tolist()
+        for _, row in trojkat.iterrows()
+    ]
+
+    return lista, trojkat, trojkat.to_numpy(dtype=float)
+
+
+
+
+
 print(sigma2_fit)
