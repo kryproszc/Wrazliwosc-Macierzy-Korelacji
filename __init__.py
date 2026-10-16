@@ -131,4 +131,24 @@ def wczytaj_trojkat(plik, arkusz, hrg, cumulative=False):
 
 
 
-print(sigma2_fit)
+import pandas as pd
+import numpy as np
+
+def wczytaj_dyskonto(plik, arkusz, hrg):
+    df = pd.read_excel(plik, sheet_name=arkusz)
+
+    df = df[
+        df["HRG"].astype(str).str.strip() == str(hrg).strip()
+    ].copy()
+
+    df = df.sort_values("YEAR")
+
+    return df["RATE"].to_numpy(dtype=float)
+
+discount_factors = wczytaj_dyskonto(
+    plik=plik,
+    arkusz="discount",
+    hrg=2
+)
+
+print(discount_factors)
