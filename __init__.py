@@ -1,154 +1,46 @@
-%load_ext autoreload
-%autoreload 2
 
-from mack import kalibracja_macka
-
-
-import pandas as pd
 import numpy as np
-
-# Wczytanie trójkąta z Excela
-df = pd.read_excel(
-    r"",
-    sheet_name=0,
-    index_col=0
-)
-
-# Konwersja do NumPy
-triangle = df.to_numpy(dtype=np.float64)
-
-
-from mack import kalibracja_macka
-L, f, fr, sigma2, nf, ns = kalibracja_macka(
-    triangle,
-    wagi
-)
-
-from mack import calculate_C_future
-
-C_future = calculate_C_future(triangle, f)
-
-
-v = np.array([
-    np.sum(triangle[:21-j, j] * wagi[:21-j, j])
-    for j in range(21)
-], dtype=np.float64)
-
-
-
-
-from mack import dopasuj_ldf
-
-ldf, b0, b1, tail, wynik = dopasuj_ldf(
-    fr,
-    v=v,
-    curve_type="weibull",
-    fit_from=4,
-    fit_to=15,
-    smooth_from=3,
-    smooth_to=21,
-    tail_length=5
-)
-
-
-
-# Wagi regresji sigma
-v_sigma = np.maximum(ns - 1, 0).astype(np.float64)
-from mack import dopasuj_sigma
-
-sigma2_fit, b0, b1, wynik = dopasuj_sigma(
-    sigma2=sigma2,
-    curve_type="weibull",
-    fit_from=5,
-    fit_to=14,
-    smooth_from=5,
-    smooth_to=21,
-    v=v_sigma
-)
-
-print(f"b0 = {b0:.15f}")
-print(f"b1 = {b1:.15f}")
-
-
-
-
-
-lista, paid_df, paid_np = wczytaj_trojkat(
-    plik=plik,
-    arkusz="paid_indexed",
-    hrg=10,
-    cumulative=False
-)
-
-print(lista)
-display(paid_df)
-
-
 import pandas as pd
-import numpy as np
+from mack import krzywa_ldf
 
-def wczytaj_trojkat(plik, arkusz, hrg, cumulative=False):
-    # Wczytanie danych
-    df = pd.read_excel(plik, sheet_name=arkusz)
+# Parametry Weibulla odtworzone z zakładu
 
-    # Wybór HRG
-    df = df[df["HRG"].astype(str).str.strip() == str(hrg).strip()].copy()
+# 1. Surowe współczynniki Chain Ladder
+LDF_zaklad = np.array(fr, dtype=np.float64, copy=True)
 
-    if df.empty:
-        raise ValueError(f"Brak danych dla HRG = {hrg}")
+# 2. Wygładzenie współczynników 4–21
+j_smooth = np.arange(4, 22, dtype=np.float64)
 
-    # Konwersja danych
-    df["VENT_YEAR"] = pd.to_numeric(df["VENT_YEAR"])
-    df["DEV_YEAR"] = pd.to_numeric(df["DEV_YEAR"])
-    df["AMOUNT"] = pd.to_numeric(
-        df["AMOUNT"].astype(str).str.replace(",", ".", regex=False)
+LDF_zaklad[3:21] = krzywa_ldf(
+    j_smooth,
+    b0_zaklad,
+    b1_zaklad,
+    curve_type="weibull"
+)
+
+# 3. Tail z pięciu okresów: 22–26
+j_tail = np.arange(22, 27, dtype=np.float64)
+
+tail_zaklad = float(np.prod(
+    krzywa_ldf(
+        j_tail,
+        b0_zaklad,
+        b1_zaklad,
+        curve_type="weibull"
     )
+))
 
-    # Budowa trójkąta
-    trojkat = df.pivot_table(
-        index="VENT_YEAR",
-        columns="DEV_YEAR",
-        values="AMOUNT",
-        aggfunc="sum"
-    )
+#from mack import calculate_paid_fit
 
-    # Uporządkowanie kolumn
-    trojkat = trojkat.sort_index().sort_index(axis=1)
-
-    # Opcjonalna kumulacja
-    if cumulative:
-        trojkat = trojkat.cumsum(axis=1)
-
-    # Lista list (bez wartości NaN na końcach wierszy)
-    lista = [
-        row.dropna().tolist()
-        for _, row in trojkat.iterrows()
-    ]
-
-    return lista, trojkat, trojkat.to_numpy(dtype=float)
-
-
-
-
-
-import pandas as pd
-import numpy as np
-
-def wczytaj_dyskonto(plik, arkusz, hrg):
-    df = pd.read_excel(plik, sheet_name=arkusz)
-
-    df = df[
-        df["HRG"].astype(str).str.strip() == str(hrg).strip()
-    ].copy()
-
-    df = df.sort_values("YEAR")
-
-    return df["RATE"].to_numpy(dtype=float)
-
-discount_factors = wczytaj_dyskonto(
-    plik=plik,
-    arkusz="discount",
-    hrg=2
+paid_fit_zaklad, BEL_zaklad = calculate_paid_fit(
+    triangle=triangle,
+    ldf=LDF_zaklad,
+    tail=tail_zaklad,
+    inflacja=inflacja,
+    start_year=2003
 )
 
-print(discount_factors)
+print("Wymiary trójkąta:", paid_fit_zaklad.shape)
+print(f"BEL = {BEL_zaklad:,.2f}")
+
+
