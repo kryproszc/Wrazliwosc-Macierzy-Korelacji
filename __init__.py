@@ -1,7 +1,13 @@
-f_ia = wspolczynniki_ia(
-    cumulative_df=lc_nb_cumulative_df,
-    ekspozycja=ekspozycja,
-    wagi=wagi_ia,
-)
-
-display(f_ia)
+if wagi is None:
+    W = pd.DataFrame(
+        1.0,
+        index=cumulative_df.index,
+        columns=cumulative_df.columns,
+    )
+else:
+    W = pd.DataFrame(
+        wagi,
+        index=cumulative_df.index,
+        columns=cumulative_df.columns,
+        dtype=float,
+    )
