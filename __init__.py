@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 
 
-def parametry_rozkladow_MM(srednia, odchylenie):
+def parametry_rozkladow_MM(srednia, sd_normal, sd_gamma_lognormal):
     m = float(srednia)
-    v = float(odchylenie) ** 2
+    v = float(sd_gamma_lognormal) ** 2
 
     sigma_log = np.sqrt(np.log1p(v / m ** 2))
     mu_log = np.log(m) - sigma_log ** 2 / 2
@@ -12,17 +12,11 @@ def parametry_rozkladow_MM(srednia, odchylenie):
     return pd.DataFrame({
         "Rozklad": ["Normal", "Gamma", "LogNormal"],
         "Metoda": ["MM", "MM", "MM"],
+        "Srednia": [m, m, m],
+        "Odchylenie": [sd_normal, sd_gamma_lognormal, sd_gamma_lognormal],
         "Parametry": [
-            {"mu": m, "sigma": float(odchylenie)},
+            {"mu": m, "sigma": float(sd_normal)},
             {"alpha": m ** 2 / v, "beta": v / m},
             {"mu": mu_log, "sigma": sigma_log},
         ],
     })
-
-
-parametry_SEV_AC = parametry_rozkladow_MM(
-    srednia=.,
-    odchylenie=,
-)
-
-display(parametry_SEV_AC)
