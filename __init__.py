@@ -1,3 +1,9 @@
+
+dane_est <- dane_lob4 %>%
+  filter(i >= 2007, i <= 2024)
+
+print(dane_est, n = Inf)
+
 # Trend liniowy ważony ekspozycją
 trend_lob4 <- lm(
   czestosc ~ i,
